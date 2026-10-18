@@ -1,0 +1,28 @@
+[package]
+name = "layer-shell-wgpu-egui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# egui = "0.28.1"
+egui = "0.32.3"
+raw-window-handle = "0.6.2"
+smithay-client-toolkit = "0.20.0"
+thiserror = "2.0.17"
+wayland-backend = { version = "0.3.6", features = ["client_system"] }
+wayland-client = "0.31.5"
+# wgpu = "0.20.1"
+# egui-wgpu = "0.28.1"
+# pollster = "0.3.0"
+
+egui_software_backend = { git = "https://github.com/DGriffin91/egui_software_backend.git", rev = "4aff48fc223524c6ec32719e6213dff657afec5e" }
+bytemuck = "1.23.2"
+log = "0.4"
+
+[dev-dependencies]
+egui_extras = { version = "0.32.3", features = ["all_loaders"] }
+# image = { version = "0.25", features = ["jpeg", "png", "gif"] } # to support more image formats
+env_logger = { version = "0.11.5", default-features = false, features = [
+  "auto-color",
+  "humantime",
+] }

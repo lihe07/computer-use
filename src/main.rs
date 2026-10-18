@@ -2,6 +2,7 @@
 
 mod desktop;
 mod ei;
+mod hud;
 mod keys;
 mod portal;
 mod windows;
@@ -18,6 +19,9 @@ use desktop::{Desktop, PasteKey};
 
 const INSTRUCTIONS: &str = "\
 Controls the user's real Wayland desktop (moves their actual cursor and keyboard focus).
+Call `control` with enabled=true before any other tool: it shows the user an \"Agent is in
+control\" HUD so they stop using the mouse and keyboard. Call it with enabled=false as soon
+as you are done or need the user to act, to hand the desktop back.
 Coordinates: by default x/y are pixels in the LAST screenshot image returned by this server
 (space=\"image\"); the server maps them to the desktop, including crops and downscaling.
 Take a fresh screenshot before acting, and again after to verify. To hit small targets,
@@ -56,10 +60,28 @@ impl Server {
         })
         .await?
     }
+
+    /// Like `with`, but refuses unless the agent has taken control.
+    async fn ctl<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&mut Desktop) -> anyhow::Result<T> + Send + 'static,
+    ) -> anyhow::Result<T> {
+        self.with(move |d| {
+            d.require_control()?;
+            f(d)
+        })
+        .await
+    }
 }
 
 fn is_desktop(space: &Option<String>) -> bool {
     space.as_deref() == Some("desktop")
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct ControlP {
+    /// true to take control (shows the HUD; required before other tools), false to hand back
+    enabled: bool,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -148,9 +170,21 @@ impl Server {
         Self { desk: Arc::new(Mutex::new(Desktop::new())), tool_router: Self::tool_router() }
     }
 
+    #[tool(description = "Take (enabled=true) or release (enabled=false) control of the desktop. \
+        All other tools require control; while held, the user sees an \"Agent is in control\" HUD.")]
+    async fn control(&self, Parameters(p): Parameters<ControlP>) -> Res {
+        let on = p.enabled;
+        match self.with(move |d| Ok(d.set_control(on))).await {
+            Ok(None) if on => text("in control; HUD shown"),
+            Ok(Some(e)) => text(format!("in control, but the HUD could not be shown: {e}")),
+            Ok(None) => text("control released; HUD hidden"),
+            Err(e) => fail(e),
+        }
+    }
+
     #[tool(description = "List monitors as logical desktop rectangles (left to right).")]
     async fn monitors(&self) -> Res {
-        match self.with(|d| d.monitors()).await {
+        match self.ctl(|d| d.monitors()).await {
             Ok(m) => text(
                 m.iter()
                     .enumerate()
@@ -259,13 +293,13 @@ impl Server {
             Some("ctrl+shift+v") => PasteKey::CtrlShiftV,
             Some(o) => return fail(format!("unknown paste_key {o:?}")),
         };
-        self.with(move |d| d.type_text(&p.text, paste)).await.map_or_else(fail, text)
+        self.ctl(move |d| d.type_text(&p.text, paste)).await.map_or_else(fail, text)
     }
 
     #[tool(description = "List open windows: id, title, app_id, states (focused/maximized/...) and \
         geometry in logical desktop coords.")]
     async fn windows(&self) -> Res {
-        let r = self.with(|d| d.windows()).await;
+        let r = self.ctl(|d| d.windows()).await;
         match r {
             Ok(w) => text(serde_json::to_string_pretty(&w).unwrap_or_default()),
             Err(e) => fail(e),
@@ -322,6 +356,9 @@ fn fix_env() {
 
 fn main() -> anyhow::Result<()> {
     fix_env();
+    if std::env::args().nth(1).as_deref() == Some(hud::ARG) {
+        return hud::run();
+    }
     tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(async {
         let service = Server::new().serve(stdio()).await?;
         service.waiting().await?;

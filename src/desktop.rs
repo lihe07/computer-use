@@ -9,6 +9,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use image::{DynamicImage, ImageFormat, imageops::FilterType};
 
 use crate::ei::{self, EiClient, Region};
+use crate::hud::Hud;
 use crate::keys;
 use crate::portal;
 use crate::windows::{Window, Windows};
@@ -44,11 +45,45 @@ pub struct Desktop {
     session: Option<portal::RemoteSession>,
     client: Option<EiClient>,
     pub last_shot: Option<Shot>,
+    /// Set by the agent via `control`; every other tool refuses to run while false.
+    in_control: bool,
+    hud: Option<Hud>,
 }
 
 impl Desktop {
     pub fn new() -> Self {
-        Self { session: None, client: None, last_shot: None }
+        Self { session: None, client: None, last_shot: None, in_control: false, hud: None }
+    }
+
+    /// Take or release control. Taking it shows the HUD; the error string, if any,
+    /// reports a HUD failure without refusing control.
+    pub fn set_control(&mut self, on: bool) -> Option<String> {
+        self.in_control = on;
+        if !on {
+            self.hud = None;
+            return None;
+        }
+        if self.hud.is_some() {
+            return None;
+        }
+        match Hud::spawn() {
+            Ok(h) => {
+                self.hud = Some(h);
+                None
+            }
+            Err(e) => Some(format!("{e:#}")),
+        }
+    }
+
+    pub fn require_control(&self) -> Result<()> {
+        if !self.in_control {
+            bail!(
+                "the agent is not in control of the desktop; call `control` with enabled=true first \
+                 (it shows the user an \"Agent is in control\" HUD so they stop using the mouse and \
+                 keyboard), and enabled=false when done"
+            );
+        }
+        Ok(())
     }
 
     fn client(&mut self) -> Result<&mut EiClient> {
@@ -84,7 +119,15 @@ impl Desktop {
         max_w: u32,
         max_h: u32,
     ) -> Result<(Vec<u8>, Shot)> {
-        let path = portal::screenshot()?;
+        // Keep the HUD out of the agent's view; a failed hide/show only costs the HUD.
+        if self.hud.as_mut().is_some_and(|h| h.set(false).is_err()) {
+            self.hud = None;
+        }
+        let path = portal::screenshot();
+        if self.hud.as_mut().is_some_and(|h| h.set(true).is_err()) {
+            self.hud = None;
+        }
+        let path = path?;
         let img = image::open(&path).with_context(|| format!("decode {}", path.display()));
         let _ = std::fs::remove_file(&path);
         let mut img = DynamicImage::ImageRgb8(img?.to_rgb8());
