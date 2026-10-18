@@ -22,7 +22,8 @@ Coordinates: by default x/y are pixels in the LAST screenshot image returned by 
 (space=\"image\"); the server maps them to the desktop, including crops and downscaling.
 Take a fresh screenshot before acting, and again after to verify. To hit small targets,
 screenshot a `region` around them (it is upscaled) and click in that image; aim at the
-center of the target. Use `windows` / `window` to find and focus apps instead of hunting
+center of the target. To drag-select text, press on the LEFT edge of the first character
+(terminals snap the selection start to the nearest cell boundary). Use `windows` / `window` to find and focus apps instead of hunting
 in screenshots. Pass space=\"desktop\" for logical desktop coordinates (see `monitors`).";
 
 type Res = Result<CallToolResult, ErrorData>;

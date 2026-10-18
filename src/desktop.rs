@@ -265,7 +265,10 @@ impl Desktop {
     }
 
     pub fn window_action(&mut self, query: &str, action: &str) -> Result<Window> {
-        Windows::connect()?.act(query, action)
+        let w = Windows::connect()?.act(query, action)?;
+        // Let workspace-switch / maximize animations settle before the next screenshot.
+        sleep(ms(400));
+        Ok(w)
     }
 }
 
