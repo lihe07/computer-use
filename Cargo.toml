@@ -1,0 +1,27 @@
+[package]
+name = "computer-use"
+version = "0.2.0"
+edition = "2024"
+description = "Computer-use MCP server for COSMIC/Wayland via xdg-desktop-portal RemoteDesktop + libei"
+
+[[bin]]
+name = "computer-use"
+path = "src/main.rs"
+
+[dependencies]
+rmcp = { version = "3.5", features = ["server", "transport-io", "macros"] }
+ashpd = { version = "0.13", default-features = false, features = ["tokio", "remote_desktop", "screencast", "screenshot"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "time", "sync"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+base64 = "0.22"
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+cosmic-protocols = { git = "https://github.com/pop-os/cosmic-protocols", rev = "c0cff4d", default-features = false, features = ["client"] }
+url = "2"
+
+[profile.release]
+strip = true
