@@ -1,5 +1,6 @@
 //! MCP server for desktop control on COSMIC/Wayland.
 
+mod control_lock;
 mod desktop;
 mod ei;
 mod hud;
@@ -22,6 +23,8 @@ Controls the user's real Wayland desktop (moves their actual cursor and keyboard
 Call `control` with enabled=true before any other tool: it shows the user an \"Agent is in
 control\" HUD so they stop using the mouse and keyboard. Call it with enabled=false as soon
 as you are done or need the user to act, to hand the desktop back.
+Control is exclusive across all server processes for this desktop user. If another agent
+holds it, control returns a busy error; wait and retry rather than using other tools.
 Coordinates: by default x/y are pixels in the LAST screenshot image returned by this server
 (space=\"image\"); the server maps them to the desktop, including crops and downscaling.
 Take a fresh screenshot before acting, and again after to verify. To hit small targets,
@@ -171,10 +174,11 @@ impl Server {
     }
 
     #[tool(description = "Take (enabled=true) or release (enabled=false) control of the desktop. \
+        Control is exclusive across agents: returns a busy error if another server holds it. \
         All other tools require control; while held, the user sees an \"Agent is in control\" HUD.")]
     async fn control(&self, Parameters(p): Parameters<ControlP>) -> Res {
         let on = p.enabled;
-        match self.with(move |d| Ok(d.set_control(on))).await {
+        match self.with(move |d| d.set_control(on)).await {
             Ok(None) if on => text("in control; HUD shown"),
             Ok(Some(e)) => text(format!("in control, but the HUD could not be shown: {e}")),
             Ok(None) => text("control released; HUD hidden"),
@@ -204,7 +208,7 @@ impl Server {
             Some(_) => return fail("region must be [x, y, w, h]"),
         };
         let r = self
-            .with(move |d| {
+            .ctl(move |d| {
                 d.screenshot(p.monitor.as_deref(), region, p.max_width.unwrap_or(1920), p.max_height.unwrap_or(1200))
             })
             .await;
@@ -223,7 +227,7 @@ impl Server {
     #[tool(description = "Click at (x, y). count=2 for double-click.")]
     async fn click(&self, Parameters(p): Parameters<ClickP>) -> Res {
         let r = self
-            .with(move |d| {
+            .ctl(move |d| {
                 let (x, y) = d.resolve(p.x, p.y, is_desktop(&p.space))?;
                 let button = p.button.unwrap_or_else(|| "left".into());
                 let count = p.count.unwrap_or(1);
@@ -237,7 +241,7 @@ impl Server {
     #[tool(description = "Move the pointer without clicking (hover).")]
     async fn move_pointer(&self, Parameters(p): Parameters<PointP>) -> Res {
         let r = self
-            .with(move |d| {
+            .ctl(move |d| {
                 let (x, y) = d.resolve(p.x, p.y, is_desktop(&p.space))?;
                 d.move_to(x, y)?;
                 Ok(format!("moved to desktop ({x:.0}, {y:.0})"))
@@ -249,7 +253,7 @@ impl Server {
     #[tool(description = "Press at (x1, y1), move to (x2, y2), release.")]
     async fn drag(&self, Parameters(p): Parameters<DragP>) -> Res {
         let r = self
-            .with(move |d| {
+            .ctl(move |d| {
                 let desk = is_desktop(&p.space);
                 let a = d.resolve(p.x1, p.y1, desk)?;
                 let b = d.resolve(p.x2, p.y2, desk)?;
@@ -263,7 +267,7 @@ impl Server {
     #[tool(description = "Scroll at (x, y) by wheel notches.")]
     async fn scroll(&self, Parameters(p): Parameters<ScrollP>) -> Res {
         let r = self
-            .with(move |d| {
+            .ctl(move |d| {
                 let (x, y) = d.resolve(p.x, p.y, is_desktop(&p.space))?;
                 let (dx, dy) = (p.dx.unwrap_or(0.0), p.dy.unwrap_or(3.0));
                 d.scroll(x, y, dx, dy)?;
@@ -276,7 +280,7 @@ impl Server {
     #[tool(description = "Press a key or chord in the focused window.")]
     async fn key(&self, Parameters(p): Parameters<KeyP>) -> Res {
         let r = self
-            .with(move |d| {
+            .ctl(move |d| {
                 let n = p.repeat.unwrap_or(1);
                 d.key(&p.combo, n)?;
                 Ok(format!("pressed {}{}", p.combo, if n > 1 { format!(" x{n}") } else { String::new() }))
@@ -310,7 +314,7 @@ impl Server {
     async fn window(&self, Parameters(p): Parameters<WindowP>) -> Res {
         let action = p.action.unwrap_or_else(|| "focus".into());
         let r = self
-            .with(move |d| {
+            .ctl(move |d| {
                 let w = d.window_action(&p.window, &action)?;
                 Ok(format!("{action}: {} ({}, id {})", w.title, w.app_id, w.id))
             })
@@ -364,4 +368,39 @@ fn main() -> anyhow::Result<()> {
         service.waiting().await?;
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn params<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> Parameters<T> {
+        Parameters(serde_json::from_value(value).unwrap())
+    }
+
+    #[tokio::test]
+    async fn every_desktop_tool_requires_control() {
+        let server = Server::new();
+        let point = json!({"x": 0, "y": 0, "space": "desktop"});
+        let results = vec![
+            server.monitors().await,
+            server.screenshot(params(json!({}))).await,
+            server.click(params(point.clone())).await,
+            server.move_pointer(params(point.clone())).await,
+            server.drag(params(json!({"x1": 0, "y1": 0, "x2": 1, "y2": 1, "space": "desktop"}))).await,
+            server.scroll(params(point)).await,
+            server.key(params(json!({"combo": "enter"}))).await,
+            server.type_text(params(json!({"text": "test"}))).await,
+            server.windows().await,
+            server.window(params(json!({"window": "test"}))).await,
+        ];
+        for result in results {
+            let result = result.unwrap();
+            assert_eq!(result.is_error, Some(true));
+            assert!(serde_json::to_string(&result).unwrap().contains("not in control"));
+        }
+        // Release is safe even for a server that never acquired control.
+        assert_ne!(server.control(params(json!({"enabled": false}))).await.unwrap().is_error, Some(true));
+    }
 }

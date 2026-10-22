@@ -8,6 +8,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use image::{DynamicImage, ImageFormat, imageops::FilterType};
 
+use crate::control_lock::ControlLock;
 use crate::ei::{self, EiClient, Region};
 use crate::hud::Hud;
 use crate::keys;
@@ -45,38 +46,44 @@ pub struct Desktop {
     session: Option<portal::RemoteSession>,
     client: Option<EiClient>,
     pub last_shot: Option<Shot>,
-    /// Set by the agent via `control`; every other tool refuses to run while false.
-    in_control: bool,
     hud: Option<Hud>,
+    /// Kept after the HUD so it is dropped last, after the banner is removed.
+    control_lock: Option<ControlLock>,
 }
 
 impl Desktop {
     pub fn new() -> Self {
-        Self { session: None, client: None, last_shot: None, in_control: false, hud: None }
+        Self { session: None, client: None, last_shot: None, hud: None, control_lock: None }
     }
 
     /// Take or release control. Taking it shows the HUD; the error string, if any,
     /// reports a HUD failure without refusing control.
-    pub fn set_control(&mut self, on: bool) -> Option<String> {
-        self.in_control = on;
+    pub fn set_control(&mut self, on: bool) -> Result<Option<String>> {
         if !on {
+            self.client = None;
+            self.session = None;
+            self.last_shot = None;
             self.hud = None;
-            return None;
+            self.control_lock = None;
+            return Ok(None);
+        }
+        if self.control_lock.is_none() {
+            self.control_lock = Some(ControlLock::acquire()?);
         }
         if self.hud.is_some() {
-            return None;
+            return Ok(None);
         }
         match Hud::spawn() {
             Ok(h) => {
                 self.hud = Some(h);
-                None
+                Ok(None)
             }
-            Err(e) => Some(format!("{e:#}")),
+            Err(e) => Ok(Some(format!("{e:#}"))),
         }
     }
 
     pub fn require_control(&self) -> Result<()> {
-        if !self.in_control {
+        if self.control_lock.is_none() {
             bail!(
                 "the agent is not in control of the desktop; call `control` with enabled=true first \
                  (it shows the user an \"Agent is in control\" HUD so they stop using the mouse and \
@@ -315,9 +322,8 @@ impl Desktop {
     }
 }
 
-const TERMINALS: &[&str] = &[
-    "foot", "wezterm", "kitty", "alacritty", "terminal", "konsole", "ghostty", "xterm", "term", "tilix", "rio",
-];
+const TERMINALS: &[&str] =
+    &["foot", "wezterm", "kitty", "alacritty", "terminal", "konsole", "ghostty", "xterm", "term", "tilix", "rio"];
 
 fn focused_is_terminal() -> bool {
     Windows::connect()
@@ -328,4 +334,37 @@ fn focused_is_terminal() -> bool {
             })
         })
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control_lock::tests::TestPath;
+
+    #[test]
+    fn releasing_non_owner_does_not_unlock_owner() {
+        let path = TestPath::new();
+        let mut owner = Desktop::new();
+        owner.control_lock = Some(ControlLock::at(&path.0).unwrap());
+        owner.require_control().unwrap();
+        let mut other = Desktop::new();
+        other.set_control(false).unwrap();
+        assert!(other.require_control().is_err());
+        assert!(ControlLock::at(&path.0).is_err());
+        owner.last_shot = Some(Shot { origin_x: 0.0, origin_y: 0.0, scale: 1.0, width: 1, height: 1 });
+        owner.set_control(false).unwrap();
+        assert!(owner.require_control().is_err());
+        assert!(owner.last_shot.is_none());
+        let _next_owner = ControlLock::at(&path.0).unwrap();
+    }
+
+    #[test]
+    fn dropping_desktop_releases_ownership() {
+        let path = TestPath::new();
+        let mut owner = Desktop::new();
+        owner.control_lock = Some(ControlLock::at(&path.0).unwrap());
+        assert!(ControlLock::at(&path.0).is_err());
+        drop(owner);
+        let _next_owner = ControlLock::at(&path.0).unwrap();
+    }
 }
