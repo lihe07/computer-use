@@ -8,7 +8,8 @@ mod keys;
 mod portal;
 mod windows;
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
@@ -33,6 +34,9 @@ center of the target. To drag-select text, press on the LEFT edge of the first c
 (terminals snap the selection start to the nearest cell boundary). Use `windows` / `window` to find and focus apps instead of hunting
 in screenshots. Pass space=\"desktop\" for logical desktop coordinates (see `monitors`).";
 
+/// Hard ceiling for the `control` tool call.
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
+
 type Res = Result<CallToolResult, ErrorData>;
 
 fn text(s: impl Into<String>) -> Res {
@@ -46,6 +50,8 @@ fn fail(e: impl std::fmt::Display) -> Res {
 #[derive(Clone)]
 struct Server {
     desk: Arc<Mutex<Desktop>>,
+    /// How long a call waits for an earlier call that still holds the desktop.
+    lock_wait: Duration,
     #[allow(dead_code)] // read by #[tool_handler]
     tool_router: ToolRouter<Self>,
 }
@@ -57,8 +63,22 @@ impl Server {
         f: impl FnOnce(&mut Desktop) -> anyhow::Result<T> + Send + 'static,
     ) -> anyhow::Result<T> {
         let desk = self.desk.clone();
+        let wait = self.lock_wait;
         tokio::task::spawn_blocking(move || {
-            let mut d = desk.lock().unwrap_or_else(|e| e.into_inner());
+            // Never block forever behind an earlier call: report it instead.
+            let deadline = Instant::now() + wait;
+            let mut d = loop {
+                match desk.try_lock() {
+                    Ok(g) => break g,
+                    Err(TryLockError::Poisoned(e)) => break e.into_inner(),
+                    Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(TryLockError::WouldBlock) => anyhow::bail!(
+                        "an earlier desktop call is still running; try again shortly"
+                    ),
+                }
+            };
             f(&mut d)
         })
         .await?
@@ -170,7 +190,7 @@ struct WindowP {
 #[tool_router]
 impl Server {
     fn new() -> Self {
-        Self { desk: Arc::new(Mutex::new(Desktop::new())), tool_router: Self::tool_router() }
+        Self { desk: Arc::new(Mutex::new(Desktop::new())), lock_wait: Duration::from_secs(10), tool_router: Self::tool_router() }
     }
 
     #[tool(description = "Take (enabled=true) or release (enabled=false) control of the desktop. \
@@ -178,7 +198,12 @@ impl Server {
         All other tools require control; while held, the user sees an \"Agent is in control\" HUD.")]
     async fn control(&self, Parameters(p): Parameters<ControlP>) -> Res {
         let on = p.enabled;
-        match self.with(move |d| d.set_control(on)).await {
+        // `with` is bounded already (mutex wait, HUD and portal timeouts); this is the backstop.
+        let r = match tokio::time::timeout(CONTROL_TIMEOUT, self.with(move |d| d.set_control(on))).await {
+            Ok(r) => r,
+            Err(_) => Err(anyhow::anyhow!("control timed out after {}s", CONTROL_TIMEOUT.as_secs())),
+        };
+        match r {
             Ok(None) if on => text("in control; HUD shown"),
             Ok(Some(e)) => text(format!("in control, but the HUD could not be shown: {e}")),
             Ok(None) => text("control released; HUD hidden"),
@@ -401,6 +426,32 @@ mod tests {
             assert!(serde_json::to_string(&result).unwrap().contains("not in control"));
         }
         // Release is safe even for a server that never acquired control.
+        assert_ne!(server.control(params(json!({"enabled": false}))).await.unwrap().is_error, Some(true));
+    }
+
+    #[tokio::test]
+    async fn control_does_not_hang_behind_a_stuck_call() {
+        let mut server = Server::new();
+        server.lock_wait = Duration::from_millis(100);
+        let held = server.desk.clone();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let stuck = std::thread::spawn(move || {
+            let _g = held.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        locked_rx.recv().unwrap();
+        let started = Instant::now();
+        for on in [true, false] {
+            let r = server.control(params(json!({ "enabled": on }))).await.unwrap();
+            assert_eq!(r.is_error, Some(true));
+            assert!(serde_json::to_string(&r).unwrap().contains("still running"));
+        }
+        assert!(started.elapsed() < Duration::from_secs(5));
+        release_tx.send(()).unwrap();
+        stuck.join().unwrap();
+        // Once the earlier call finishes, release works again.
         assert_ne!(server.control(params(json!({"enabled": false}))).await.unwrap().is_error, Some(true));
     }
 }

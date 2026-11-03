@@ -109,7 +109,11 @@ impl EiClient {
     pub fn pump(&mut self, timeout: Duration) {
         unsafe {
             let mut pfd = libc_pollfd { fd: ei_get_fd(self.ei), events: 1, revents: 0 };
+            let mut hung_up = false;
             if poll(&mut pfd, 1, timeout.as_millis() as c_int) > 0 {
+                // POLLERR | POLLHUP | POLLNVAL: the socket is dead. poll would now return
+                // immediately forever, so treat it as a disconnect instead of spinning on it.
+                hung_up = pfd.revents & 0x38 != 0;
                 ei_dispatch(self.ei);
             }
             loop {
@@ -178,6 +182,9 @@ impl EiClient {
                     _ => {}
                 }
                 ei_event_unref(ev);
+            }
+            if hung_up {
+                self.disconnected = true;
             }
         }
     }
