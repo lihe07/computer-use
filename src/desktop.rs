@@ -1,4 +1,6 @@
-//! Stateful desktop controller: portal session + EI connection, screenshot mapping.
+//! Desktop engine, run inside the worker process (worker.rs): portal session, EI
+//! connection, screenshots, input and the window list. Control, the HUD and screenshot
+//! coordinates stay in the server (controller.rs).
 
 use std::io::Cursor;
 use std::process::{Command, Stdio};
@@ -8,9 +10,9 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use image::{DynamicImage, ImageFormat, imageops::FilterType};
 
-use crate::control_lock::ControlLock;
+use serde::{Deserialize, Serialize};
+
 use crate::ei::{self, EiClient, Region};
-use crate::hud::Hud;
 use crate::keys;
 use crate::portal;
 use crate::windows::{Window, Windows};
@@ -20,7 +22,7 @@ const fn ms(n: u64) -> Duration {
 }
 
 /// Maps pixels of the last returned image back to logical desktop coordinates.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Shot {
     pub origin_x: f64,
     pub origin_y: f64,
@@ -35,7 +37,7 @@ impl Shot {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum PasteKey {
     Auto,
     CtrlV,
@@ -45,52 +47,16 @@ pub enum PasteKey {
 pub struct Desktop {
     session: Option<portal::RemoteSession>,
     client: Option<EiClient>,
-    pub last_shot: Option<Shot>,
-    hud: Option<Hud>,
-    /// Kept after the HUD so it is dropped last, after the banner is removed.
-    control_lock: Option<ControlLock>,
 }
 
 impl Desktop {
     pub fn new() -> Self {
-        Self { session: None, client: None, last_shot: None, hud: None, control_lock: None }
+        Self { session: None, client: None }
     }
 
-    /// Take or release control. Taking it shows the HUD; the error string, if any,
-    /// reports a HUD failure without refusing control.
-    pub fn set_control(&mut self, on: bool) -> Result<Option<String>> {
-        if !on {
-            self.client = None;
-            self.session = None;
-            self.last_shot = None;
-            self.hud = None;
-            self.control_lock = None;
-            return Ok(None);
-        }
-        if self.control_lock.is_none() {
-            self.control_lock = Some(ControlLock::acquire()?);
-        }
-        if self.hud.is_some() {
-            return Ok(None);
-        }
-        match Hud::spawn() {
-            Ok(h) => {
-                self.hud = Some(h);
-                Ok(None)
-            }
-            Err(e) => Ok(Some(format!("{e:#}"))),
-        }
-    }
-
-    pub fn require_control(&self) -> Result<()> {
-        if self.control_lock.is_none() {
-            bail!(
-                "the agent is not in control of the desktop; call `control` with enabled=true first \
-                 (it shows the user an \"Agent is in control\" HUD so they stop using the mouse and \
-                 keyboard), and enabled=false when done"
-            );
-        }
-        Ok(())
+    /// Bring up (or check) the portal session and input connection.
+    pub fn connect(&mut self) -> Result<()> {
+        self.client().map(|_| ())
     }
 
     fn client(&mut self) -> Result<&mut EiClient> {
@@ -126,15 +92,7 @@ impl Desktop {
         max_w: u32,
         max_h: u32,
     ) -> Result<(Vec<u8>, Shot)> {
-        // Keep the HUD out of the agent's view; a failed hide/show only costs the HUD.
-        if self.hud.as_mut().is_some_and(|h| h.set(false).is_err()) {
-            self.hud = None;
-        }
-        let path = portal::screenshot();
-        if self.hud.as_mut().is_some_and(|h| h.set(true).is_err()) {
-            self.hud = None;
-        }
-        let path = path?;
+        let path = portal::screenshot()?;
         let img = image::open(&path).with_context(|| format!("decode {}", path.display()));
         let _ = std::fs::remove_file(&path);
         let mut img = DynamicImage::ImageRgb8(img?.to_rgb8());
@@ -174,16 +132,7 @@ impl Desktop {
         let mut buf = Cursor::new(Vec::new());
         img.write_to(&mut buf, ImageFormat::Png)?;
         let shot = Shot { origin_x: ox, origin_y: oy, scale, width: img.width(), height: img.height() };
-        self.last_shot = Some(shot);
         Ok((buf.into_inner(), shot))
-    }
-
-    pub fn resolve(&self, x: f64, y: f64, desktop: bool) -> Result<(f64, f64)> {
-        if desktop {
-            return Ok((x, y));
-        }
-        let shot = self.last_shot.ok_or_else(|| anyhow!("no screenshot taken yet; take one or use space=desktop"))?;
-        Ok(shot.to_desktop(x, y))
     }
 
     // -- input ----------------------------------------------------------------------------
@@ -334,37 +283,4 @@ fn focused_is_terminal() -> bool {
             })
         })
         .unwrap_or(false)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::control_lock::tests::TestPath;
-
-    #[test]
-    fn releasing_non_owner_does_not_unlock_owner() {
-        let path = TestPath::new();
-        let mut owner = Desktop::new();
-        owner.control_lock = Some(ControlLock::at(&path.0).unwrap());
-        owner.require_control().unwrap();
-        let mut other = Desktop::new();
-        other.set_control(false).unwrap();
-        assert!(other.require_control().is_err());
-        assert!(ControlLock::at(&path.0).is_err());
-        owner.last_shot = Some(Shot { origin_x: 0.0, origin_y: 0.0, scale: 1.0, width: 1, height: 1 });
-        owner.set_control(false).unwrap();
-        assert!(owner.require_control().is_err());
-        assert!(owner.last_shot.is_none());
-        let _next_owner = ControlLock::at(&path.0).unwrap();
-    }
-
-    #[test]
-    fn dropping_desktop_releases_ownership() {
-        let path = TestPath::new();
-        let mut owner = Desktop::new();
-        owner.control_lock = Some(ControlLock::at(&path.0).unwrap());
-        assert!(ControlLock::at(&path.0).is_err());
-        drop(owner);
-        let _next_owner = ControlLock::at(&path.0).unwrap();
-    }
 }

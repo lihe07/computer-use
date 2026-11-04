@@ -58,7 +58,7 @@ unsafe extern "C" {
     fn ei_device_keyboard_key(dev: P, keycode: u32, is_press: bool);
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Region {
     pub x: u32,
     pub y: u32,

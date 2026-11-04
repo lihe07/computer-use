@@ -1,12 +1,14 @@
 //! MCP server for desktop control on COSMIC/Wayland.
 
 mod control_lock;
+mod controller;
 mod desktop;
 mod ei;
 mod hud;
 mod keys;
 mod portal;
 mod windows;
+mod worker;
 
 use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
@@ -17,7 +19,8 @@ use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabiliti
 use rmcp::{ErrorData, ServerHandler, ServiceExt, schemars, tool, tool_handler, tool_router, transport::stdio};
 use serde::Deserialize;
 
-use desktop::{Desktop, PasteKey};
+use controller::Controller;
+use desktop::PasteKey;
 
 const INSTRUCTIONS: &str = "\
 Controls the user's real Wayland desktop (moves their actual cursor and keyboard focus).
@@ -49,7 +52,7 @@ fn fail(e: impl std::fmt::Display) -> Res {
 
 #[derive(Clone)]
 struct Server {
-    desk: Arc<Mutex<Desktop>>,
+    desk: Arc<Mutex<Controller>>,
     /// How long a call waits for an earlier call that still holds the desktop.
     lock_wait: Duration,
     #[allow(dead_code)] // read by #[tool_handler]
@@ -60,7 +63,7 @@ impl Server {
     /// Run `f` with the desktop on a blocking thread (input uses sleeps; portal calls block_on).
     async fn with<T: Send + 'static>(
         &self,
-        f: impl FnOnce(&mut Desktop) -> anyhow::Result<T> + Send + 'static,
+        f: impl FnOnce(&mut Controller) -> anyhow::Result<T> + Send + 'static,
     ) -> anyhow::Result<T> {
         let desk = self.desk.clone();
         let wait = self.lock_wait;
@@ -87,7 +90,7 @@ impl Server {
     /// Like `with`, but refuses unless the agent has taken control.
     async fn ctl<T: Send + 'static>(
         &self,
-        f: impl FnOnce(&mut Desktop) -> anyhow::Result<T> + Send + 'static,
+        f: impl FnOnce(&mut Controller) -> anyhow::Result<T> + Send + 'static,
     ) -> anyhow::Result<T> {
         self.with(move |d| {
             d.require_control()?;
@@ -190,7 +193,7 @@ struct WindowP {
 #[tool_router]
 impl Server {
     fn new() -> Self {
-        Self { desk: Arc::new(Mutex::new(Desktop::new())), lock_wait: Duration::from_secs(10), tool_router: Self::tool_router() }
+        Self { desk: Arc::new(Mutex::new(Controller::new())), lock_wait: Duration::from_secs(10), tool_router: Self::tool_router() }
     }
 
     #[tool(description = "Take (enabled=true) or release (enabled=false) control of the desktop. \
@@ -341,7 +344,8 @@ impl Server {
         let r = self
             .ctl(move |d| {
                 let w = d.window_action(&p.window, &action)?;
-                Ok(format!("{action}: {} ({}, id {})", w.title, w.app_id, w.id))
+                let f = |k: &str| w.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_owned();
+                Ok(format!("{action}: {} ({}, id {})", f("title"), f("app_id"), f("id")))
             })
             .await;
         r.map_or_else(fail, text)
@@ -385,8 +389,10 @@ fn fix_env() {
 
 fn main() -> anyhow::Result<()> {
     fix_env();
-    if std::env::args().nth(1).as_deref() == Some(hud::ARG) {
-        return hud::run();
+    match std::env::args().nth(1).as_deref() {
+        Some(hud::ARG) => return hud::run(),
+        Some(worker::ARG) => return worker::run(),
+        _ => {}
     }
     tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(async {
         let service = Server::new().serve(stdio()).await?;
