@@ -7,6 +7,7 @@ mod ei;
 mod hud;
 mod keys;
 mod portal;
+mod portal_repair;
 mod windows;
 mod worker;
 
@@ -374,20 +375,26 @@ fn fix_env() {
             std::env::set_var("DBUS_SESSION_BUS_ADDRESS", format!("unix:path={runtime}/bus"));
         }
         if std::env::var_os("WAYLAND_DISPLAY").is_none() {
-            let sock = std::fs::read_dir(&runtime).ok().and_then(|it| {
-                it.flatten()
-                    .map(|e| e.file_name().to_string_lossy().into_owned())
-                    .filter(|n| n.starts_with("wayland-") && !n.ends_with(".lock"))
-                    .min()
-            });
-            if let Some(s) = sock {
-                std::env::set_var("WAYLAND_DISPLAY", s);
+            let uid = std::fs::metadata("/proc/self").map(|m| std::os::unix::fs::MetadataExt::uid(&m)).unwrap_or(1000);
+            match portal_repair::discover(uid, std::path::Path::new(&runtime)) {
+                Ok(env) => {
+                    for (key, value) in env {
+                        if std::env::var_os(&key).is_none() {
+                            std::env::set_var(key, value);
+                        }
+                    }
+                }
+                Err(e) => eprintln!("computer-use: cannot infer desktop session: {e:#}"),
             }
         }
     }
 }
 
 fn main() -> anyhow::Result<()> {
+    // Repair must inspect the caller's display before fix_env guesses one.
+    if std::env::args().nth(1).as_deref() == Some("--repair-portal") {
+        return portal_repair::run();
+    }
     fix_env();
     match std::env::args().nth(1).as_deref() {
         Some(hud::ARG) => return hud::run(),
