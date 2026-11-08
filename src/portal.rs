@@ -192,7 +192,13 @@ pub fn screenshot() -> Result<PathBuf> {
             Screenshot::request().interactive(false).modal(false).send().await?.response()
         })
         .await
-        .map_err(|_| anyhow!("timed out waiting for the screenshot portal"))??;
+        .map_err(|_| anyhow!(
+            "timed out waiting for the screenshot portal; restarting the MCP does not restart \
+             xdg-desktop-portal. Check `systemctl --user status xdg-desktop-portal.service`. \
+             On COSMIC, release desktop control and run `computer-use --repair-portal` to \
+             restore the desktop activation environment and restart the portal services \
+             (this interrupts existing screen-sharing sessions)"
+        ))??;
         url::Url::parse(shot.uri().as_str())?
             .to_file_path()
             .map_err(|_| anyhow!("screenshot uri is not a local file: {}", shot.uri().as_str()))

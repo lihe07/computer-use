@@ -43,3 +43,29 @@ until the server was restarted.
 Build with Rust 1.89 or newer using `cargo build --release --locked`.
 Run `cargo test --locked` for ownership and tool-gating checks without touching
 the live desktop.
+
+## Screenshot portal timeouts on COSMIC
+
+If screenshots time out even after restarting the MCP, inspect
+`systemctl --user status xdg-desktop-portal.service`. A user service manager
+restarted from a terminal or SSH session can lose `XDG_CURRENT_DESKTOP` and
+`WAYLAND_DISPLAY`. The portal then selects the wrong backend or cannot connect
+to the compositor. Changing the MCP's own environment does not repair the
+environment used by D-Bus and systemd to activate portal services.
+
+Release desktop control, then run `computer-use --repair-portal`. This explicit
+command restores only graphical session variables from a running, same-user
+`cosmic-comp` and its owned listening socket, updates the D-Bus/systemd activation environment, and restarts the
+COSMIC backend and portal frontend. **Existing screen-sharing sessions will be
+interrupted.** It does not restart the compositor or log you out. Each external
+command has a deadline; errors are reported without an automatic retry.
+
+Repair refuses to run while another agent owns desktop control or if the COSMIC
+session is ambiguous. For multiple sessions, select the intended one with
+`WAYLAND_DISPLAY=wayland-1 computer-use --repair-portal` (use your actual display).
+Then retry `control` and `screenshot`. Permission denial and cancelled capture
+requests are still returned normally; this does not bypass portal permissions.
+
+When the MCP host omits `WAYLAND_DISPLAY`, startup also uses the compositor-owned
+socket. It no longer picks the first `wayland-*` entry, which may belong to an
+outer compositor when COSMIC is nested. Explicit display settings are preserved.
