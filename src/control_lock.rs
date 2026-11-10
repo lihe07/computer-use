@@ -1,8 +1,10 @@
 //! One owner across all MCP server processes for the logged-in desktop user.
 
 use std::fs::{File, TryLockError};
+use std::io::{Read, Seek, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 
@@ -37,15 +39,75 @@ impl ControlLock {
             .open(path)
             .with_context(|| format!("open desktop control lock {}", path.display()))?;
         match file.try_lock() {
-            Ok(()) => Ok(Self { file }),
-            Err(TryLockError::WouldBlock) => bail!(
-                "desktop is busy: another agent holds control; wait until it releases control \
-                 before retrying `control` with enabled=true"
-            ),
+            Ok(()) => {
+                let mut lock = Self { file };
+                lock.write_holder();
+                Ok(lock)
+            }
+            Err(TryLockError::WouldBlock) => {
+                let mut held_by = String::new();
+                let _ = (&file).read_to_string(&mut held_by);
+                bail!(
+                    "desktop is busy: another agent holds control{}. Wait until it releases control before \
+                     retrying `control` with enabled=true; an owner that makes no desktop call for {} minutes \
+                     loses control automatically",
+                    describe_holder(&held_by).map(|h| format!(" ({h})")).unwrap_or_default(),
+                    crate::controller::IDLE_RELEASE.as_secs() / 60,
+                )
+            }
             Err(TryLockError::Error(e)) => Err(e).context("lock desktop control"),
         }
         // Never unlink the file: a waiter may already have opened the same inode.
     }
+}
+
+impl ControlLock {
+    /// Record who holds the lock, for the busy error other agents get. The lock itself
+    /// is the flock; this text is only a description and may be stale or empty.
+    fn write_holder(&mut self) {
+        let pid = std::process::id();
+        let session = parent_session();
+        let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
+        let since = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let text = serde_json::json!({ "pid": pid, "session": session, "cwd": cwd, "since": since }).to_string();
+        let _ = self.file.set_len(0);
+        let _ = self.file.rewind();
+        let _ = self.file.write_all(text.as_bytes());
+        let _ = self.file.flush();
+    }
+}
+
+/// The MCP host that started us: its `-n <name>` / `--name <name>` if it has one
+/// (Claude Code session names), else its command name.
+fn parent_session() -> String {
+    let ppid = std::fs::read_to_string("/proc/self/stat")
+        .ok()
+        .and_then(|s| s.rsplit_once(')').and_then(|(_, rest)| rest.split_whitespace().nth(1).map(str::to_owned)))
+        .unwrap_or_default();
+    let args: Vec<String> = std::fs::read(format!("/proc/{ppid}/cmdline"))
+        .map(|b| b.split(|c| *c == 0).map(|a| String::from_utf8_lossy(a).into_owned()).collect())
+        .unwrap_or_default();
+    let named = args.windows(2).find(|w| w[0] == "-n" || w[0] == "--name").map(|w| w[1].clone());
+    named.unwrap_or_else(|| {
+        args.first().map(|a| a.rsplit('/').next().unwrap_or(a).to_owned()).unwrap_or_default()
+    })
+}
+
+fn describe_holder(text: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(text.trim()).ok()?;
+    let pid = v.get("pid")?.as_u64()?;
+    let mut parts = vec![format!("server pid {pid}")];
+    if let Some(s) = v.get("session").and_then(|s| s.as_str()).filter(|s| !s.is_empty()) {
+        parts.push(format!("session {s:?}"));
+    }
+    if let Some(c) = v.get("cwd").and_then(|s| s.as_str()).filter(|s| !s.is_empty()) {
+        parts.push(format!("cwd {c}"));
+    }
+    if let Some(since) = v.get("since").and_then(|s| s.as_u64()) {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(since);
+        parts.push(format!("for {}", crate::controller::human(std::time::Duration::from_secs(now.saturating_sub(since)))));
+    }
+    Some(parts.join(", "))
 }
 
 #[cfg(test)]
@@ -83,7 +145,9 @@ pub(crate) mod tests {
     fn exclusive_until_released() {
         let path = TestPath::new();
         let owner = ControlLock::at(&path.0).unwrap();
-        assert!(ControlLock::at(&path.0).unwrap_err().to_string().contains("another agent"));
+        let busy = ControlLock::at(&path.0).unwrap_err().to_string();
+        assert!(busy.contains("another agent"), "{busy}");
+        assert!(busy.contains(&format!("server pid {}", std::process::id())), "{busy}");
         drop(owner);
         let _next_owner = ControlLock::at(&path.0).unwrap();
     }

@@ -4,6 +4,61 @@ use anyhow::{Result, bail};
 
 pub const SHIFT: u32 = 42;
 
+/// Canonical spelling: "Page_Down", "page-down" and "PageDown" all become "pagedown";
+/// common aliases map to the names below ("arrowup" -> "up", "esc" stays "esc").
+fn canonical(part: &str) -> String {
+    let p = part.trim().to_lowercase();
+    if p.chars().count() == 1 {
+        return p; // "-", "_", "a": the character itself
+    }
+    let p: String = p.chars().filter(|c| !matches!(c, '_' | '-' | ' ')).collect();
+    let p = p.strip_prefix("arrow").filter(|r| matches!(*r, "up" | "down" | "left" | "right")).map(str::to_owned).unwrap_or(p);
+    match p.as_str() {
+        "lctrl" | "controlleft" | "ctrlleft" => "leftctrl".into(),
+        "rctrl" | "controlright" | "ctrlright" => "rightctrl".into(),
+        "lshift" | "shiftleft" => "leftshift".into(),
+        "rshift" | "shiftright" => "rightshift".into(),
+        "lalt" | "altleft" | "option" | "opt" => "alt".into(),
+        "ralt" | "altright" => "rightalt".into(),
+        "lsuper" | "superleft" | "logo" | "windows" | "command" | "metaleft" => "super".into(),
+        "rsuper" | "superright" | "metaright" => "rightmeta".into(),
+        "ret" | "newline" | "kpenter" => "enter".into(),
+        "bksp" | "backspace" => "backspace".into(),
+        "spacebar" => "space".into(),
+        "prtsc" | "prtscr" | "printscr" => "print".into(),
+        "ins" => "insert".into(),
+        "pageup" | "prior" => "pageup".into(),
+        "pagedown" | "next_page" => "pagedown".into(),
+        "contextmenu" | "apps" | "application" => "menu".into(),
+        "plus" => "+".into(),
+        "underscore" => "_".into(),
+        "hyphen" | "dash" => "-".into(),
+        "lessthan" | "less" => "<".into(),
+        "greaterthan" | "greater" => ">".into(),
+        "question" | "questionmark" => "?".into(),
+        "exclamation" | "exclam" | "bang" => "!".into(),
+        "at" => "@".into(),
+        "hash" | "numbersign" | "pound" => "#".into(),
+        "dollar" => "$".into(),
+        "percent" => "%".into(),
+        "caret" | "circumflex" => "^".into(),
+        "ampersand" => "&".into(),
+        "asterisk" | "star" => "*".into(),
+        "colon" => ":".into(),
+        "quote" | "doublequote" => "\"".into(),
+        "pipe" | "bar" => "|".into(),
+        "tilde" => "~".into(),
+        "backtick" | "backquote" => "`".into(),
+        "leftparen" | "parenleft" => "(".into(),
+        "rightparen" | "parenright" => ")".into(),
+        "leftbracket" | "bracketleft" => "[".into(),
+        "rightbracket" | "bracketright" => "]".into(),
+        "leftcurly" | "braceleft" => "{".into(),
+        "rightcurly" | "braceright" => "}".into(),
+        _ => p,
+    }
+}
+
 pub fn named(name: &str) -> Option<u32> {
     Some(match name {
         "esc" | "escape" => 1,
@@ -57,7 +112,27 @@ pub fn named(name: &str) -> Option<u32> {
         "volumeup" => 115,
         "super" | "meta" | "win" | "cmd" | "leftmeta" => 125,
         "rightmeta" => 126,
-        "menu" => 139,
+        "menu" | "compose" => 139,
+        "pause" | "break" => 119,
+        "scrolllock" => 70,
+        "numlock" => 69,
+        "sysrq" => 99,
+        "f13" => 183,
+        "f14" => 184,
+        "f15" => 185,
+        "f16" => 186,
+        "f17" => 187,
+        "f18" => 188,
+        "f19" => 189,
+        "f20" => 190,
+        "f21" => 191,
+        "f22" => 192,
+        "f23" => 193,
+        "f24" => 194,
+        "playpause" => 164,
+        "nextsong" | "next" => 163,
+        "previoussong" | "prev" | "previous" => 165,
+        "stop" => 166,
         _ => return None,
     })
 }
@@ -88,19 +163,43 @@ pub fn char_key(ch: char) -> Option<(u32, bool)> {
     None
 }
 
-/// "ctrl+shift+t" -> [29, 42, 20]
+/// "ctrl+shift+t" -> [29, 42, 20]. A shifted character adds shift: "ctrl+plus" ->
+/// ctrl+shift+equal. A literal "+" key is written "plus" (or a trailing "+": "ctrl++").
 pub fn parse_combo(combo: &str) -> Result<Vec<u32>> {
+    let mut parts: Vec<String> = combo.split('+').map(canonical).collect();
+    // "ctrl++" splits into ["ctrl", "", ""]: the empty tail is the "+" key itself.
+    if combo.trim_end().ends_with("++") || combo.trim() == "+" {
+        parts.retain(|p| !p.is_empty());
+        parts.push("+".into());
+    }
     let mut out = Vec::new();
-    for part in combo.to_lowercase().split('+').map(str::trim).filter(|p| !p.is_empty()) {
-        if let Some(k) = named(part) {
+    let push = |k: u32, out: &mut Vec<u32>| {
+        if !out.contains(&k) {
             out.push(k);
+        }
+    };
+    for part in parts.iter().filter(|p| !p.is_empty()) {
+        if let Some(k) = named(part) {
+            push(k, &mut out);
         } else if let (Some(ch), 1) = (part.chars().next(), part.chars().count()) {
             match char_key(ch) {
-                Some((k, false)) => out.push(k),
-                _ => bail!("unknown key {part:?}"),
+                Some((k, shift)) => {
+                    if shift {
+                        // Shift goes down before the key, like a person would press it.
+                        let at = out.len();
+                        if !out.contains(&SHIFT) {
+                            out.insert(at, SHIFT);
+                        }
+                    }
+                    push(k, &mut out);
+                }
+                None => bail!("unknown key {part:?}"),
             }
         } else {
-            bail!("unknown key {part:?}");
+            bail!(
+                "unknown key {part:?}; use names like enter, tab, esc, backspace, delete, up, pagedown, home, f5, \
+                 ctrl, shift, alt, super, or single characters"
+            );
         }
     }
     if out.is_empty() {
@@ -110,12 +209,50 @@ pub fn parse_combo(combo: &str) -> Result<Vec<u32>> {
 }
 
 pub fn button(name: &str) -> Result<u32> {
-    Ok(match name {
-        "left" => 0x110,
-        "right" => 0x111,
-        "middle" => 0x112,
-        "back" => 0x113,
-        "forward" => 0x114,
+    Ok(match name.trim().to_lowercase().as_str() {
+        "left" | "primary" | "1" => 0x110,
+        "right" | "secondary" | "context" | "3" => 0x111,
+        "middle" | "wheel" | "2" => 0x112,
+        "back" | "side" | "4" => 0x113,
+        "forward" | "extra" | "5" => 0x114,
         _ => bail!("unknown button {name:?}"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spellings_of_the_same_key_agree() {
+        for c in ["pagedown", "page_down", "Page-Down", "PageDown", "pgdn"] {
+            assert_eq!(parse_combo(c).unwrap(), vec![109], "{c}");
+        }
+        assert_eq!(parse_combo("ArrowUp").unwrap(), vec![103]);
+        assert_eq!(parse_combo("Ctrl+Shift+T").unwrap(), vec![29, 42, 20]);
+        assert_eq!(parse_combo("cmd+l").unwrap(), vec![125, 38]);
+    }
+
+    #[test]
+    fn shifted_characters_add_shift() {
+        assert_eq!(parse_combo("ctrl+plus").unwrap(), vec![29, SHIFT, 13]);
+        assert_eq!(parse_combo("ctrl++").unwrap(), vec![29, SHIFT, 13]);
+        assert_eq!(parse_combo("ctrl+shift+plus").unwrap(), vec![29, SHIFT, 13]);
+        assert_eq!(parse_combo("?").unwrap(), vec![SHIFT, 53]);
+        assert_eq!(parse_combo("ctrl+-").unwrap(), vec![29, 12]);
+    }
+
+    #[test]
+    fn bad_keys_are_rejected() {
+        assert!(parse_combo("").is_err());
+        assert!(parse_combo("ctrl+nosuchkey").unwrap_err().to_string().contains("unknown key"));
+        assert!(parse_combo("é").is_err());
+    }
+
+    #[test]
+    fn every_ascii_printable_has_a_key() {
+        for ch in (0x20u8..0x7f).map(char::from) {
+            assert!(char_key(ch).is_some(), "{ch:?}");
+        }
+    }
 }

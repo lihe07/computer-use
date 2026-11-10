@@ -19,8 +19,9 @@ use tokio::time::timeout;
 
 /// Budget for a negotiation that presents a saved restore token (no dialog expected).
 pub(crate) const TOKEN_ATTEMPT: Duration = Duration::from_secs(10);
-/// Budget for a negotiation without a token (the user may have to approve a dialog).
-pub(crate) const FRESH_ATTEMPT: Duration = Duration::from_secs(25);
+/// How long a consent dialog stays open for the user. Calls do not wait this long:
+/// they poll the background negotiation (`Pending`) and return while it is open.
+pub(crate) const APPROVAL_WINDOW: Duration = Duration::from_secs(300);
 const EIS_TIMEOUT: Duration = Duration::from_secs(5);
 const SCREENSHOT_TIMEOUT: Duration = Duration::from_secs(20);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -150,17 +151,20 @@ where
 }
 
 impl RemoteSession {
-    /// Shows the approval dialog only when there is no valid saved restore token. Bounded in time.
-    pub fn start() -> Result<Self> {
-        Handle::current().block_on(async {
+    /// Start negotiating in the background: the saved restore token first (no dialog),
+    /// then a fresh request whose consent dialog stays open for `APPROVAL_WINDOW`.
+    /// Calls poll the returned handle, so one dialog serves every call until it is
+    /// answered, instead of each call opening its own and abandoning it after 25s.
+    pub fn begin() -> Pending {
+        Pending(Handle::current().spawn(async {
             let (rd, session) =
-                start_with_fallback(&token_file(), (TOKEN_ATTEMPT, FRESH_ATTEMPT), |token, budget| async move {
+                start_with_fallback(&token_file(), (TOKEN_ATTEMPT, APPROVAL_WINDOW), |token, budget| async move {
                     let (rd, session, new) = attempt(token, budget).await?;
                     Ok(((rd, session), new))
                 })
                 .await?;
             Ok(Self { inner: Some((rd, session)) })
-        })
+        }))
     }
 
     pub fn connect_to_eis(&self) -> Result<OwnedFd> {
@@ -171,6 +175,29 @@ impl RemoteSession {
                 .map_err(|_| anyhow!("timed out connecting to the input emulation service"))?
                 .map_err(Into::into)
         })
+    }
+}
+
+/// A remote-desktop negotiation running in the background (see `RemoteSession::begin`).
+pub struct Pending(tokio::task::JoinHandle<Result<RemoteSession>>);
+
+impl Pending {
+    /// Wait up to `wait`: the session once negotiated, `None` while it is still pending
+    /// (normally a consent dialog the user has not answered), or why it failed.
+    pub fn wait(&mut self, wait: Duration) -> Result<Option<RemoteSession>> {
+        Handle::current().block_on(async {
+            match timeout(wait, &mut self.0).await {
+                Ok(joined) => joined.map_err(|e| anyhow!("portal negotiation crashed: {e}"))?.map(Some),
+                Err(_) => Ok(None),
+            }
+        })
+    }
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        // Cancelling the request closes its dialog.
+        self.0.abort();
     }
 }
 

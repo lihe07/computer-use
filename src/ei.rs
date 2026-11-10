@@ -1,7 +1,7 @@
 //! Minimal sender-side libei client over FFI.
 
 use std::collections::HashMap;
-use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::ffi::{CString, c_char, c_int, c_void};
 use std::os::fd::{IntoRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
@@ -43,13 +43,6 @@ unsafe extern "C" {
     fn ei_device_ref(dev: P) -> P;
     fn ei_device_unref(dev: P) -> P;
     fn ei_device_has_capability(dev: P, cap: u32) -> bool;
-    fn ei_device_get_region(dev: P, index: usize) -> P;
-    fn ei_region_get_x(r: P) -> u32;
-    fn ei_region_get_y(r: P) -> u32;
-    fn ei_region_get_width(r: P) -> u32;
-    fn ei_region_get_height(r: P) -> u32;
-    fn ei_region_get_physical_scale(r: P) -> f64;
-    fn ei_region_get_mapping_id(r: P) -> *const c_char;
     fn ei_device_start_emulating(dev: P, sequence: u32);
     fn ei_device_frame(dev: P, time: u64);
     fn ei_device_pointer_motion_absolute(dev: P, x: f64, y: f64);
@@ -58,20 +51,9 @@ unsafe extern "C" {
     fn ei_device_keyboard_key(dev: P, keycode: u32, is_press: bool);
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct Region {
-    pub x: u32,
-    pub y: u32,
-    pub w: u32,
-    pub h: u32,
-    pub scale: f64,
-    pub name: String,
-}
-
 struct Device {
     ptr: P,
     caps: u32,
-    regions: Vec<Region>,
     resumed: bool,
     emulating: bool,
 }
@@ -85,10 +67,6 @@ pub struct EiClient {
 
 // The client is only ever used behind a Mutex from one thread at a time.
 unsafe impl Send for EiClient {}
-
-fn cstr(p: *const c_char) -> String {
-    if p.is_null() { String::new() } else { unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned() }
-}
 
 impl EiClient {
     pub fn new(fd: OwnedFd) -> Result<Self> {
@@ -110,7 +88,7 @@ impl EiClient {
         unsafe {
             let mut pfd = libc_pollfd { fd: ei_get_fd(self.ei), events: 1, revents: 0 };
             let mut hung_up = false;
-            if poll(&mut pfd, 1, timeout.as_millis() as c_int) > 0 {
+            if poll(&mut pfd, 1, timeout.as_millis().min(i32::MAX as u128) as c_int) > 0 {
                 // POLLERR | POLLHUP | POLLNVAL: the socket is dead. poll would now return
                 // immediately forever, so treat it as a disconnect instead of spinning on it.
                 hung_up = pfd.revents & 0x38 != 0;
@@ -138,27 +116,9 @@ impl EiClient {
                     EV_DEVICE_ADDED => {
                         let d = ei_event_get_device(ev);
                         let caps = ALL_CAPS.iter().filter(|&&c| ei_device_has_capability(d, c)).fold(0, |a, c| a | c);
-                        let mut regions = Vec::new();
-                        let mut i = 0;
-                        loop {
-                            let r = ei_device_get_region(d, i);
-                            if r.is_null() {
-                                break;
-                            }
-                            regions.push(Region {
-                                x: ei_region_get_x(r),
-                                y: ei_region_get_y(r),
-                                w: ei_region_get_width(r),
-                                h: ei_region_get_height(r),
-                                scale: ei_region_get_physical_scale(r),
-                                name: cstr(ei_region_get_mapping_id(r)),
-                            });
-                            i += 1;
-                        }
                         self.devices.insert(d as usize, Device {
                             ptr: ei_device_ref(d),
                             caps,
-                            regions,
                             resumed: false,
                             emulating: false,
                         });
@@ -212,10 +172,6 @@ impl EiClient {
             .ok_or_else(|| anyhow!("no resumed EI device with capability {cap:#x}"))
     }
 
-    pub fn regions(&mut self) -> Result<Vec<Region>> {
-        Ok(self.device(CAP_POINTER_ABSOLUTE)?.regions.clone())
-    }
-
     fn emit(&mut self, cap: u32, f: impl FnOnce(P)) -> Result<()> {
         let ei = self.ei;
         let seq = self.seq;
@@ -266,6 +222,17 @@ impl Drop for EiClient {
             ei_unref(self.ei);
         }
     }
+}
+
+/// Wait until `fd` is readable: Some(true) readable, Some(false) timed out, None hung up.
+pub(crate) fn poll_readable(fd: c_int, timeout: Duration) -> Option<bool> {
+    let mut pfd = libc_pollfd { fd, events: 1, revents: 0 };
+    let n = unsafe { poll(&mut pfd, 1, timeout.as_millis().min(i32::MAX as u128) as c_int) };
+    if n <= 0 {
+        return Some(false);
+    }
+    // POLLERR | POLLHUP | POLLNVAL without POLLIN: nothing left to read, ever.
+    if pfd.revents & 0x38 != 0 && pfd.revents & 1 == 0 { None } else { Some(true) }
 }
 
 #[repr(C)]

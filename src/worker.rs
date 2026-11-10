@@ -30,11 +30,11 @@ use crate::desktop::{Desktop, PasteKey};
 
 pub const ARG: &str = "--worker";
 
-/// Budget for bringing up the portal session and input connection: a restore-token
-/// attempt (10s), a fresh attempt that may wait on a consent dialog (25s), EIS connect
-/// (5s) and device readiness (5s); portal.rs and Desktop::client bound each of those.
-/// Two attempts must fit in the MCP client's 120s tool-call limit.
-pub const CONNECT_BUDGET: Duration = Duration::from_secs(45);
+/// Budget for bringing up the input connection: one poll of the background portal
+/// negotiation (20s, desktop::APPROVAL_POLL; a consent dialog stays open across calls
+/// instead), EIS connect (5s), device readiness (5s) and settling. Two attempts plus
+/// the action must fit in the MCP client's 120s tool-call limit.
+pub const CONNECT_BUDGET: Duration = Duration::from_secs(40);
 /// How long a graceful quit may take before the worker is killed.
 const QUIT_BUDGET: Duration = Duration::from_secs(3);
 
@@ -43,16 +43,21 @@ const QUIT_BUDGET: Duration = Duration::from_secs(3);
 pub enum Req {
     /// Liveness check; touches nothing.
     Ping,
-    /// Bring up the portal session and input connection.
-    Connect,
+    /// Bring up the portal session and input connection. `release` first lets go of
+    /// every modifier (set after a worker died mid-action, which may have held one).
+    Connect {
+        #[serde(default)]
+        release: bool,
+    },
     Monitors,
     Screenshot { monitor: Option<String>, region: Option<(i64, i64, i64, i64)>, max_w: u32, max_h: u32 },
     Move { x: f64, y: f64 },
-    Click { x: f64, y: f64, button: String, count: u32, modifiers: String },
+    Click { x: f64, y: f64, button: String, count: u32, modifiers: String, expect: Option<String> },
     Drag { from: (f64, f64), to: (f64, f64), button: String },
     Scroll { x: f64, y: f64, dx: f64, dy: f64 },
-    Key { combo: String, repeat: u32 },
-    Type { text: String, paste: PasteKey },
+    Key { combo: String, repeat: u32, expect: Option<String> },
+    Type { text: String, paste: PasteKey, expect: Option<String> },
+    Clipboard { set: Option<String> },
     Windows,
     Window { query: String, action: String },
     /// Close the session and exit.
@@ -63,15 +68,26 @@ impl Req {
     /// Whether the call needs the input connection (and so a `Connect` first).
     pub fn needs_input(&self) -> bool {
         match self {
-            Req::Ping | Req::Connect | Req::Window { .. } | Req::Quit => false,
-            Req::Screenshot { monitor, .. } => monitor.is_some(),
-            _ => true,
+            Req::Ping
+            | Req::Connect { .. }
+            | Req::Window { .. }
+            | Req::Quit
+            | Req::Monitors
+            | Req::Screenshot { .. }
+            | Req::Windows
+            | Req::Clipboard { .. } => false,
+            Req::Move { .. } | Req::Click { .. } | Req::Drag { .. } | Req::Scroll { .. } | Req::Key { .. } | Req::Type { .. } => {
+                true
+            }
         }
     }
 
     /// Whether running it twice is harmless (reads only).
     pub fn idempotent(&self) -> bool {
-        matches!(self, Req::Ping | Req::Connect | Req::Monitors | Req::Screenshot { .. } | Req::Windows)
+        matches!(
+            self,
+            Req::Ping | Req::Connect { .. } | Req::Monitors | Req::Screenshot { .. } | Req::Windows | Req::Clipboard { set: None }
+        )
     }
 
     /// Deadline for one call, once the worker is connected.
@@ -80,9 +96,9 @@ impl Req {
         let ms = Duration::from_millis;
         match self {
             Req::Ping | Req::Quit => s(5),
-            Req::Connect => CONNECT_BUDGET,
-            // portal.rs gives the screenshot portal 20s; decoding and scaling come on top.
-            Req::Screenshot { .. } => s(35),
+            Req::Connect { .. } => CONNECT_BUDGET,
+            // Direct capture (8s per output), then the portal fallback (20s), then scaling.
+            Req::Screenshot { .. } => s(45),
             Req::Key { repeat, .. } => s(10) + ms(60) * (*repeat).min(10_000),
             Req::Click { count, .. } => s(10) + ms(100) * (*count).min(1_000),
             // keystrokes run ~10ms each; a paste adds wl-copy and the focus check.
@@ -165,7 +181,8 @@ fn serve() -> Result<()> {
         }
         let result = (|| -> Result<Value> {
             if env.req.needs_input() {
-                desk.connect()?;
+                desk.connect(false)?;
+                check_focus(&mut desk, &env.req)?;
                 send(&Reply { id, ready: true, ..Default::default() })?;
             }
             execute(&mut desk, env.req)
@@ -179,11 +196,41 @@ fn serve() -> Result<()> {
     Ok(())
 }
 
+/// Refuse input when the caller named the window it expects to have focus and a
+/// different one has it: typing into the wrong window is the costliest mistake here.
+fn check_focus(desk: &mut Desktop, req: &Req) -> Result<()> {
+    let expect = match req {
+        Req::Key { expect, .. } | Req::Type { expect, .. } | Req::Click { expect, .. } => expect.as_deref(),
+        _ => None,
+    };
+    let Some(expect) = expect.map(str::trim).filter(|e| !e.is_empty()) else { return Ok(()) };
+    let focused = desk.focused();
+    let ok = focused.as_ref().is_some_and(|w| {
+        let q = expect.to_lowercase();
+        w.id == expect || w.title.to_lowercase().contains(&q) || w.app_id.to_lowercase().contains(&q)
+    });
+    if !ok {
+        let now = focused.map_or("no window".to_owned(), |w| format!("{:?} ({})", w.title, w.app_id));
+        bail!(
+            "nothing was sent: the focused window is {now}, not one matching {expect:?}. Focus the right window (`window` tool), take a screenshot, then retry"
+        );
+    }
+    Ok(())
+}
+
+/// What an input action reports: where the keyboard focus is afterwards.
+fn focus_report(desk: &mut Desktop) -> Value {
+    match desk.focused() {
+        Some(w) => json!({ "focused": { "id": w.id, "title": w.title, "app_id": w.app_id } }),
+        None => json!({ "focused": null }),
+    }
+}
+
 fn execute(desk: &mut Desktop, req: Req) -> Result<Value> {
     Ok(match req {
         Req::Ping => json!("pong"),
-        Req::Connect => {
-            desk.connect()?;
+        Req::Connect { release } => {
+            desk.connect(release)?;
             Value::Null
         }
         Req::Monitors => serde_json::to_value(desk.monitors()?)?,
@@ -195,9 +242,10 @@ fn execute(desk: &mut Desktop, req: Req) -> Result<Value> {
             desk.move_to(x, y)?;
             Value::Null
         }
-        Req::Click { x, y, button, count, modifiers } => {
+        Req::Click { x, y, button, count, modifiers, .. } => {
             desk.click(x, y, &button, count, &modifiers)?;
-            Value::Null
+            sleep_settle();
+            focus_report(desk)
         }
         Req::Drag { from, to, button } => {
             desk.drag(from, to, &button)?;
@@ -207,15 +255,27 @@ fn execute(desk: &mut Desktop, req: Req) -> Result<Value> {
             desk.scroll(x, y, dx, dy)?;
             Value::Null
         }
-        Req::Key { combo, repeat } => {
+        Req::Key { combo, repeat, .. } => {
             desk.key(&combo, repeat)?;
-            Value::Null
+            sleep_settle();
+            focus_report(desk)
         }
-        Req::Type { text, paste } => json!(desk.type_text(&text, paste)?),
+        Req::Type { text, paste, .. } => {
+            let done = desk.type_text(&text, paste)?;
+            let mut v = focus_report(desk);
+            v["done"] = json!(done);
+            v
+        }
+        Req::Clipboard { set } => json!(desk.clipboard(set.as_deref())?),
         Req::Windows => serde_json::to_value(desk.windows()?)?,
         Req::Window { query, action } => serde_json::to_value(desk.window_action(&query, &action)?)?,
         Req::Quit => Value::Null,
     })
+}
+
+/// Let a click or shortcut take effect before reading back the focus.
+fn sleep_settle() {
+    std::thread::sleep(Duration::from_millis(60));
 }
 
 // ---- server side ----------------------------------------------------------------------
@@ -244,6 +304,9 @@ pub struct Backend {
     next_id: u64,
     /// Upper bound on every deadline (tests use it to fail fast).
     cap: Option<Duration>,
+    /// A worker died after it may have pressed something: the next connection first
+    /// releases every modifier so nothing stays held on the compositor side.
+    release_next: bool,
 }
 
 /// What became of a call that did not complete.
@@ -258,14 +321,19 @@ enum Failure {
 impl Backend {
     pub fn new() -> Self {
         Self::with_spawner(Box::new(|| {
-            let mut cmd = Command::new(std::env::current_exe().unwrap_or_else(|_| "computer-use".into()));
+            let mut cmd = Command::new(crate::self_exe());
             cmd.arg(ARG);
             cmd
         }))
     }
 
     pub fn with_spawner(spawn: Spawner) -> Self {
-        Self { spawn, proc: None, next_id: 1, cap: None }
+        Self { spawn, proc: None, next_id: 1, cap: None, release_next: false }
+    }
+
+    /// Whether a worker is running (and so may hold a portal session).
+    pub fn is_running(&mut self) -> bool {
+        self.live().is_some()
     }
 
     /// Run one request with its deadline. A hung or dead worker is killed; a call that
@@ -307,15 +375,21 @@ impl Backend {
     fn attempt(&mut self, req: &Req) -> Result<Value, Failure> {
         let lost = |emitted: bool, why: String| Failure::Lost { emitted, why };
         if req.needs_input() && !self.live().is_some_and(|p| p.connected) {
-            self.exchange(&Req::Connect, self.budget(&Req::Connect)).map_err(|f| match f {
+            let connect = Req::Connect { release: self.release_next };
+            self.exchange(&connect, self.budget(&connect)).map_err(|f| match f {
                 Failure::Lost { why, .. } => lost(false, why),
                 other => other,
             })?;
+            self.release_next = false;
             if let Some(p) = self.proc.as_mut() {
                 p.connected = true;
             }
         }
-        self.exchange(req, self.budget(req))
+        let r = self.exchange(req, self.budget(req));
+        if matches!(r, Err(Failure::Lost { emitted: true, .. })) {
+            self.release_next = true;
+        }
+        r
     }
 
     fn budget(&self, req: &Req) -> Duration {
@@ -455,13 +529,13 @@ mod tests {
     fn answers_come_back() {
         let mut b = sh(ECHO);
         assert_eq!(b.call(Req::Ping).unwrap(), json!("done"));
-        assert_eq!(b.call(Req::Key { combo: "a".into(), repeat: 1 }).unwrap(), json!("done"));
+        assert_eq!(b.call(Req::Key { combo: "a".into(), repeat: 1, expect: None }).unwrap(), json!("done"));
     }
 
     #[test]
     fn a_hung_worker_is_killed_and_the_call_returns() {
         // Never answers anything: Connect hangs, the worker is killed, the retry hangs too.
-        let mut b = sh("sleep 1000");
+        let mut b = sh("exec sleep 1000");
         let started = Instant::now();
         let err = b.call(Req::Ping).unwrap_err();
         assert!(format!("{err:#}").contains("hung twice"), "{err:#}");
@@ -477,7 +551,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let marker = dir.join("seen");
         let script = format!(
-            "if [ -e '{m}' ]; then {echo}; else touch '{m}'; sleep 1000; fi",
+            "if [ -e '{m}' ]; then {echo}; else touch '{m}'; exec sleep 1000; fi",
             m = marker.display(),
             echo = ECHO
         );
@@ -490,13 +564,40 @@ mod tests {
     #[test]
     fn input_that_may_have_been_sent_is_not_replayed() {
         // Answers Connect, says "ready" for the key, then hangs: the key must not be retried.
-        let script = r#"while IFS= read -r l; do id=$(printf '%s' "$l" | sed 's/.*"id":\([0-9]*\).*/\1/'); case "$l" in *'"op":"connect"'*) printf '{"id":%s,"ok":null}\n' "$id";; *) printf '{"id":%s,"ready":true}\n' "$id"; sleep 1000;; esac; done"#;
+        let script = r#"while IFS= read -r l; do id=$(printf '%s' "$l" | sed 's/.*"id":\([0-9]*\).*/\1/'); case "$l" in *'"op":"connect"'*) printf '{"id":%s,"ok":null}\n' "$id";; *) printf '{"id":%s,"ready":true}\n' "$id"; exec sleep 1000;; esac; done"#;
         let mut b = sh(script);
         let started = Instant::now();
         let err = b.call(Req::Move { x: 1.0, y: 1.0 }).unwrap_err();
         assert!(format!("{err:#}").contains("mid-action"), "{err:#}");
         // One capped budget, no retry.
         assert!(started.elapsed() < Duration::from_millis(1500), "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn after_an_interrupted_action_the_next_connect_releases_modifiers() {
+        // Logs every request; hangs on the first key (after "ready"), answers the rest.
+        let dir = std::env::temp_dir().join(format!("cu-release-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("log");
+        let marker = dir.join("hung");
+        let script = format!(
+            r#"while IFS= read -r l; do printf '%s\n' "$l" >> '{log}'; id=$(printf '%s' "$l" | sed 's/.*"id":\([0-9]*\).*/\1/'); case "$l" in *'"op":"key"'*) if [ ! -e '{m}' ]; then touch '{m}'; printf '{{"id":%s,"ready":true}}\n' "$id"; exec sleep 1000; fi;; esac; printf '{{"id":%s,"ok":null}}\n' "$id"; done"#,
+            log = log.display(),
+            m = marker.display()
+        );
+        let script: &'static str = Box::leak(script.into_boxed_str());
+        let mut b = sh(script);
+        let key = || Req::Key { combo: "ctrl+a".into(), repeat: 1, expect: None };
+        assert!(format!("{:#}", b.call(key()).unwrap_err()).contains("mid-action"));
+        b.call(key()).unwrap();
+        let lines = std::fs::read_to_string(&log).unwrap();
+        let connects: Vec<&str> = lines.lines().filter(|l| l.contains(r#""op":"connect""#)).collect();
+        assert_eq!(connects.len(), 2, "{lines}");
+        assert!(connects[0].contains(r#""release":false"#), "{lines}");
+        assert!(connects[1].contains(r#""release":true"#), "{lines}");
+        drop(b);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

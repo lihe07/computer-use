@@ -35,7 +35,7 @@ pub struct Hud {
 impl Hud {
     /// Spawns the HUD and waits (bounded) until it is on screen.
     pub fn spawn() -> Result<Self> {
-        let mut cmd = Command::new(std::env::current_exe()?);
+        let mut cmd = Command::new(crate::self_exe());
         cmd.arg(ARG);
         Self::spawn_command(cmd, SPAWN_TIMEOUT)
     }
