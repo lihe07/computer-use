@@ -138,7 +138,7 @@ pub fn run() -> Result<()> {
 }
 
 fn serve() -> Result<()> {
-    let mut desk = Desktop::new();
+    let mut desk = None;
     let stdin = std::io::stdin();
     let mut out = std::io::stdout();
     let mut send = |reply: &Reply| -> Result<()> {
@@ -164,11 +164,15 @@ fn serve() -> Result<()> {
             return Ok(());
         }
         let result = (|| -> Result<Value> {
+            let desk = match &mut desk {
+                Some(desk) => desk,
+                None => desk.insert(Desktop::new()?),
+            };
             if env.req.needs_input() {
                 desk.connect()?;
                 send(&Reply { id, ready: true, ..Default::default() })?;
             }
-            execute(&mut desk, env.req)
+            execute(desk, env.req)
         })();
         let reply = match result {
             Ok(v) => Reply { id, ok: Some(v), ..Default::default() },

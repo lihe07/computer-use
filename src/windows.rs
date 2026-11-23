@@ -30,7 +30,7 @@ pub struct Window {
     pub states: Vec<&'static str>,
     pub geometry: Vec<Geometry>,
     #[serde(skip)]
-    closed: bool,
+    pub(crate) closed: bool,
 }
 
 struct Top {

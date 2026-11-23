@@ -118,6 +118,9 @@ impl Frames {
 
 /// Child-side entry point: runs the overlay until stdin closes.
 pub fn run() -> Result<()> {
+    if crate::x11::selected() {
+        return crate::x11::hud();
+    }
     let visible = Arc::new(AtomicBool::new(true));
     let frames = Arc::new(Frames::default());
     let ctx_slot: Arc<Mutex<Option<egui::Context>>> = Arc::default();

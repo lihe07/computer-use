@@ -1,4 +1,4 @@
-//! MCP server for desktop control on COSMIC/Wayland.
+//! MCP server for desktop control on Wayland and X11.
 
 mod control_lock;
 mod controller;
@@ -10,6 +10,7 @@ mod portal;
 mod portal_repair;
 mod windows;
 mod worker;
+mod x11;
 
 use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
@@ -24,7 +25,7 @@ use controller::Controller;
 use desktop::PasteKey;
 
 const INSTRUCTIONS: &str = "\
-Controls the user's real Wayland desktop (moves their actual cursor and keyboard focus).
+Controls the user's real desktop (moves their actual cursor and keyboard focus).
 Call `control` with enabled=true before any other tool: it shows the user an \"Agent is in
 control\" HUD so they stop using the mouse and keyboard. Call it with enabled=false as soon
 as you are done or need the user to act, to hand the desktop back.
@@ -364,6 +365,9 @@ impl ServerHandler for Server {
 
 /// MCP hosts may launch us with a scrubbed env; recover the user session's bus and display.
 fn fix_env() {
+    if x11::selected() {
+        return;
+    }
     let runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| {
         let uid = std::fs::metadata("/proc/self").map(|m| std::os::unix::fs::MetadataExt::uid(&m)).unwrap_or(1000);
         format!("/run/user/{uid}")
