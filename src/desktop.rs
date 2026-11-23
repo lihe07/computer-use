@@ -1,6 +1,4 @@
-//! Desktop engine, run inside the worker process (worker.rs): portal session, EI
-//! connection, screenshots, input and the window list. Control, the HUD and screenshot
-//! coordinates stay in the server (controller.rs).
+//! Backend selection and shared screenshot and input processing for the worker.
 
 use std::io::Cursor;
 use std::process::{Command, Stdio};
@@ -12,10 +10,9 @@ use image::{DynamicImage, ImageFormat, imageops::FilterType};
 
 use serde::{Deserialize, Serialize};
 
-use crate::ei::{self, EiClient, Region};
+use crate::ei::Region;
 use crate::keys;
-use crate::portal;
-use crate::windows::{Window, Windows};
+use crate::{wayland, windows::Window, x11};
 
 const fn ms(n: u64) -> Duration {
     Duration::from_millis(n)
@@ -44,42 +41,55 @@ pub enum PasteKey {
     CtrlShiftV,
 }
 
-pub struct Desktop {
-    session: Option<portal::RemoteSession>,
-    client: Option<EiClient>,
+pub struct Backend {
+    pub prepare_env: fn(),
+    pub hud: fn() -> Result<()>,
+    pub open: fn() -> Result<Box<dyn DesktopBackend>>,
 }
 
-impl Desktop {
-    pub fn new() -> Self {
-        Self { session: None, client: None }
-    }
-
-    /// Bring up (or check) the portal session and input connection.
-    pub fn connect(&mut self) -> Result<()> {
-        self.client().map(|_| ())
-    }
-
-    fn client(&mut self) -> Result<&mut EiClient> {
-        if let Some(c) = self.client.as_mut() {
-            c.pump(Duration::ZERO);
-            if !c.disconnected {
-                return Ok(self.client.as_mut().unwrap());
-            }
+impl Backend {
+    pub fn select() -> Self {
+        let present = |name| std::env::var_os(name).is_some_and(|value| !value.is_empty());
+        let x11 =
+            std::env::var("XDG_SESSION_TYPE").as_deref() == Ok("x11") || (present("DISPLAY") && !present("WAYLAND_DISPLAY"));
+        if x11 {
+            Self { prepare_env: || {}, hud: x11::hud, open: || Ok(Box::new(x11::X11::open()?)) }
+        } else {
+            Self { prepare_env: wayland::prepare_env, hud: wayland::hud, open: || Ok(Box::new(wayland::Wayland::default())) }
         }
-        self.client = None;
-        self.session = None;
-        let session = portal::RemoteSession::start()?;
-        let mut client = EiClient::new(session.connect_to_eis()?)?;
-        client.wait_ready(ei::CAP_POINTER_ABSOLUTE | ei::CAP_BUTTON | ei::CAP_KEYBOARD, Duration::from_secs(5))?;
-        self.session = Some(session);
-        Ok(self.client.insert(client))
+    }
+}
+
+pub trait DesktopBackend {
+    fn connect(&mut self) -> Result<()> {
+        Ok(())
+    }
+    fn capture(&self) -> Result<DynamicImage>;
+    fn monitors(&mut self) -> Result<Vec<Region>>;
+    fn move_abs(&mut self, x: f64, y: f64) -> Result<()>;
+    fn button(&mut self, code: u32, press: bool) -> Result<()>;
+    fn scroll(&mut self, dx: f64, dy: f64) -> Result<()>;
+    fn key(&mut self, code: u32, press: bool) -> Result<()>;
+    fn pump(&mut self, duration: Duration) {
+        sleep(duration);
+    }
+    fn windows(&mut self) -> Result<Vec<Window>>;
+    fn window_action(&mut self, query: &str, action: &str) -> Result<Window>;
+    fn clipboard(&self) -> (&str, &[&str]);
+}
+
+pub struct Desktop(pub Box<dyn DesktopBackend>);
+
+impl Desktop {
+    pub fn connect(&mut self) -> Result<()> {
+        self.0.connect()
     }
 
     /// Logical monitor rects, left to right.
     pub fn monitors(&mut self) -> Result<Vec<Region>> {
-        let mut r = self.client()?.regions()?;
-        r.sort_by_key(|m| (m.x, m.y));
-        Ok(r)
+        let mut monitors = self.0.monitors()?;
+        monitors.sort_by_key(|m| (m.x, m.y));
+        Ok(monitors)
     }
 
     // -- screenshots ----------------------------------------------------------------------
@@ -92,10 +102,7 @@ impl Desktop {
         max_w: u32,
         max_h: u32,
     ) -> Result<(Vec<u8>, Shot)> {
-        let path = portal::screenshot()?;
-        let img = image::open(&path).with_context(|| format!("decode {}", path.display()));
-        let _ = std::fs::remove_file(&path);
-        let mut img = DynamicImage::ImageRgb8(img?.to_rgb8());
+        let mut img = self.0.capture()?;
 
         let region = match monitor {
             Some(m) => {
@@ -138,13 +145,13 @@ impl Desktop {
     // -- input ----------------------------------------------------------------------------
 
     pub fn move_to(&mut self, x: f64, y: f64) -> Result<()> {
-        self.client()?.move_abs(x, y)
+        self.0.move_abs(x, y)
     }
 
     pub fn click(&mut self, x: f64, y: f64, button: &str, count: u32, modifiers: &str) -> Result<()> {
         let code = keys::button(button)?;
         let mods = if modifiers.trim().is_empty() { vec![] } else { keys::parse_combo(modifiers)? };
-        let c = self.client()?;
+        let c = &mut self.0;
         c.move_abs(x, y)?;
         sleep(ms(30));
         for &m in &mods {
@@ -165,7 +172,7 @@ impl Desktop {
 
     pub fn drag(&mut self, from: (f64, f64), to: (f64, f64), button: &str) -> Result<()> {
         let code = keys::button(button)?;
-        let c = self.client()?;
+        let c = &mut self.0;
         c.move_abs(from.0, from.1)?;
         sleep(ms(30));
         c.button(code, true)?;
@@ -182,7 +189,7 @@ impl Desktop {
     }
 
     pub fn scroll(&mut self, x: f64, y: f64, dx: f64, dy: f64) -> Result<()> {
-        let c = self.client()?;
+        let c = &mut self.0;
         c.move_abs(x, y)?;
         sleep(ms(20));
         c.scroll(dx, dy)?;
@@ -192,7 +199,7 @@ impl Desktop {
 
     pub fn key(&mut self, combo: &str, repeat: u32) -> Result<()> {
         let codes = keys::parse_combo(combo)?;
-        let c = self.client()?;
+        let c = &mut self.0;
         for _ in 0..repeat.max(1) {
             for &k in &codes {
                 c.key(k, true)?;
@@ -211,7 +218,7 @@ impl Desktop {
     pub fn type_text(&mut self, text: &str, paste: PasteKey) -> Result<String> {
         let keys: Option<Vec<(u32, bool)>> = text.chars().map(keys::char_key).collect();
         let Some(keys) = keys else { return self.paste(text, paste) };
-        let c = self.client()?;
+        let c = &mut self.0;
         for (code, shift) in keys {
             if shift {
                 c.key(keys::SHIFT, true)?;
@@ -228,18 +235,23 @@ impl Desktop {
     }
 
     fn paste(&mut self, text: &str, paste: PasteKey) -> Result<String> {
-        let mut child = Command::new("wl-copy")
+        let (program, args) = self.0.clipboard();
+        let mut child = Command::new(program)
+            .args(args)
             .stdin(Stdio::piped())
+            .stdout(Stdio::null())
             .spawn()
-            .context("non-ASCII text needs wl-copy (wl-clipboard)")?;
-        std::io::Write::write_all(child.stdin.as_mut().unwrap(), text.as_bytes())?;
-        drop(child.stdin.take());
-        child.wait()?;
+            .with_context(|| format!("non-ASCII text needs {program}"))?;
+        std::io::Write::write_all(&mut child.stdin.take().unwrap(), text.as_bytes())?;
+        let status = child.wait()?;
+        if !status.success() {
+            bail!("{program} failed: {status}");
+        }
         sleep(ms(80));
         let shift = match paste {
             PasteKey::CtrlV => false,
             PasteKey::CtrlShiftV => true,
-            PasteKey::Auto => focused_is_terminal(),
+            PasteKey::Auto => self.0.windows().is_ok_and(|wins| wins.iter().any(is_focused_terminal)),
         };
         let combo = if shift { "ctrl+shift+v" } else { "ctrl+v" };
         self.key(combo, 1)?;
@@ -250,21 +262,11 @@ impl Desktop {
 
     /// Windows with geometry translated to logical desktop coordinates.
     pub fn windows(&mut self) -> Result<Vec<Window>> {
-        let mons = self.monitors()?;
-        let mut wins = Windows::connect()?.list();
-        for w in &mut wins {
-            for g in &mut w.geometry {
-                if let Some(m) = mons.iter().find(|m| m.name == g.output) {
-                    g.x += m.x as i32;
-                    g.y += m.y as i32;
-                }
-            }
-        }
-        Ok(wins)
+        self.0.windows()
     }
 
     pub fn window_action(&mut self, query: &str, action: &str) -> Result<Window> {
-        let w = Windows::connect()?.act(query, action)?;
+        let w = self.0.window_action(query, action)?;
         // Let workspace-switch / maximize animations settle before the next screenshot.
         sleep(ms(400));
         Ok(w)
@@ -274,13 +276,7 @@ impl Desktop {
 const TERMINALS: &[&str] =
     &["foot", "wezterm", "kitty", "alacritty", "terminal", "konsole", "ghostty", "xterm", "term", "tilix", "rio"];
 
-fn focused_is_terminal() -> bool {
-    Windows::connect()
-        .map(|w| {
-            w.list().iter().any(|w| {
-                let id = w.app_id.to_lowercase();
-                w.states.contains(&"focused") && TERMINALS.iter().any(|t| id.contains(t))
-            })
-        })
-        .unwrap_or(false)
+fn is_focused_terminal(w: &Window) -> bool {
+    let id = w.app_id.to_lowercase();
+    w.states.contains(&"focused") && TERMINALS.iter().any(|t| id.contains(t))
 }

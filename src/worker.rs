@@ -32,7 +32,7 @@ pub const ARG: &str = "--worker";
 
 /// Budget for bringing up the portal session and input connection: a restore-token
 /// attempt (10s), a fresh attempt that may wait on a consent dialog (25s), EIS connect
-/// (5s) and device readiness (5s); portal.rs and Desktop::client bound each of those.
+/// (5s) and device readiness (5s); portal.rs and the Wayland backend bound each of those.
 /// Two attempts must fit in the MCP client's 120s tool-call limit.
 pub const CONNECT_BUDGET: Duration = Duration::from_secs(45);
 /// How long a graceful quit may take before the worker is killed.
@@ -41,8 +41,6 @@ const QUIT_BUDGET: Duration = Duration::from_secs(3);
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Req {
-    /// Liveness check; touches nothing.
-    Ping,
     /// Bring up the portal session and input connection.
     Connect,
     Monitors,
@@ -63,7 +61,7 @@ impl Req {
     /// Whether the call needs the input connection (and so a `Connect` first).
     pub fn needs_input(&self) -> bool {
         match self {
-            Req::Ping | Req::Connect | Req::Window { .. } | Req::Quit => false,
+            Req::Connect | Req::Window { .. } | Req::Quit => false,
             Req::Screenshot { monitor, .. } => monitor.is_some(),
             _ => true,
         }
@@ -71,7 +69,7 @@ impl Req {
 
     /// Whether running it twice is harmless (reads only).
     pub fn idempotent(&self) -> bool {
-        matches!(self, Req::Ping | Req::Connect | Req::Monitors | Req::Screenshot { .. } | Req::Windows)
+        matches!(self, Req::Connect | Req::Monitors | Req::Screenshot { .. } | Req::Windows)
     }
 
     /// Deadline for one call, once the worker is connected.
@@ -79,7 +77,7 @@ impl Req {
         let s = Duration::from_secs;
         let ms = Duration::from_millis;
         match self {
-            Req::Ping | Req::Quit => s(5),
+            Req::Quit => s(5),
             Req::Connect => CONNECT_BUDGET,
             // portal.rs gives the screenshot portal 20s; decoding and scaling come on top.
             Req::Screenshot { .. } => s(35),
@@ -118,7 +116,7 @@ unsafe extern "C" {
 }
 
 /// Child entry point: serve requests from stdin until it closes or the parent dies.
-pub fn run() -> Result<()> {
+pub fn run(backend: crate::desktop::Backend) -> Result<()> {
     // If the server dies (even by SIGKILL) while this process is stuck in a C loop,
     // stdin EOF is never read; watch for reparenting instead.
     let parent = unsafe { getppid() };
@@ -133,12 +131,12 @@ pub fn run() -> Result<()> {
     tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(async {
         // portal.rs drives its async calls with Handle::block_on, so the loop runs on a
         // blocking thread that has the runtime context.
-        tokio::task::spawn_blocking(serve).await?
+        tokio::task::spawn_blocking(move || serve(backend)).await?
     })
 }
 
-fn serve() -> Result<()> {
-    let mut desk = Desktop::new();
+fn serve(backend: crate::desktop::Backend) -> Result<()> {
+    let mut desk = None;
     let stdin = std::io::stdin();
     let mut out = std::io::stdout();
     let mut send = |reply: &Reply| -> Result<()> {
@@ -164,11 +162,15 @@ fn serve() -> Result<()> {
             return Ok(());
         }
         let result = (|| -> Result<Value> {
+            let desk = match &mut desk {
+                Some(desk) => desk,
+                None => desk.insert(Desktop((backend.open)()?)),
+            };
             if env.req.needs_input() {
                 desk.connect()?;
                 send(&Reply { id, ready: true, ..Default::default() })?;
             }
-            execute(&mut desk, env.req)
+            execute(desk, env.req)
         })();
         let reply = match result {
             Ok(v) => Reply { id, ok: Some(v), ..Default::default() },
@@ -181,7 +183,6 @@ fn serve() -> Result<()> {
 
 fn execute(desk: &mut Desktop, req: Req) -> Result<Value> {
     Ok(match req {
-        Req::Ping => json!("pong"),
         Req::Connect => {
             desk.connect()?;
             Value::Null
@@ -438,10 +439,11 @@ pub fn screenshot_reply(v: Value) -> Result<(Vec<u8>, crate::desktop::Shot)> {
 mod tests {
     use super::*;
 
-    fn sh(script: &'static str) -> Backend {
+    fn sh(script: impl Into<String>) -> Backend {
+        let script = script.into();
         let mut b = Backend::with_spawner(Box::new(move || {
             let mut c = Command::new("sh");
-            c.arg("-c").arg(script);
+            c.arg("-c").arg(&script);
             c
         }));
         b.cap = Some(Duration::from_millis(700));
@@ -454,16 +456,16 @@ mod tests {
     #[test]
     fn answers_come_back() {
         let mut b = sh(ECHO);
-        assert_eq!(b.call(Req::Ping).unwrap(), json!("done"));
+        assert_eq!(b.call(Req::Monitors).unwrap(), json!("done"));
         assert_eq!(b.call(Req::Key { combo: "a".into(), repeat: 1 }).unwrap(), json!("done"));
     }
 
     #[test]
     fn a_hung_worker_is_killed_and_the_call_returns() {
         // Never answers anything: Connect hangs, the worker is killed, the retry hangs too.
-        let mut b = sh("sleep 1000");
+        let mut b = sh("exec sleep 1000");
         let started = Instant::now();
-        let err = b.call(Req::Ping).unwrap_err();
+        let err = b.call(Req::Monitors).unwrap_err();
         assert!(format!("{err:#}").contains("hung twice"), "{err:#}");
         assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
         assert!(b.proc.is_none(), "hung worker must be gone");
@@ -477,20 +479,19 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let marker = dir.join("seen");
         let script = format!(
-            "if [ -e '{m}' ]; then {echo}; else touch '{m}'; sleep 1000; fi",
+            "if [ -e '{m}' ]; then {echo}; else touch '{m}'; exec sleep 1000; fi",
             m = marker.display(),
             echo = ECHO
         );
-        let script: &'static str = Box::leak(script.into_boxed_str());
         let mut b = sh(script);
-        assert_eq!(b.call(Req::Ping).unwrap(), json!("done"));
+        assert_eq!(b.call(Req::Monitors).unwrap(), json!("done"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn input_that_may_have_been_sent_is_not_replayed() {
         // Answers Connect, says "ready" for the key, then hangs: the key must not be retried.
-        let script = r#"while IFS= read -r l; do id=$(printf '%s' "$l" | sed 's/.*"id":\([0-9]*\).*/\1/'); case "$l" in *'"op":"connect"'*) printf '{"id":%s,"ok":null}\n' "$id";; *) printf '{"id":%s,"ready":true}\n' "$id"; sleep 1000;; esac; done"#;
+        let script = r#"while IFS= read -r l; do id=$(printf '%s' "$l" | sed 's/.*"id":\([0-9]*\).*/\1/'); case "$l" in *'"op":"connect"'*) printf '{"id":%s,"ok":null}\n' "$id";; *) printf '{"id":%s,"ready":true}\n' "$id"; exec sleep 1000;; esac; done"#;
         let mut b = sh(script);
         let started = Instant::now();
         let err = b.call(Req::Move { x: 1.0, y: 1.0 }).unwrap_err();
@@ -502,7 +503,7 @@ mod tests {
     #[test]
     fn worker_errors_are_reported_not_retried() {
         let mut b = sh(r#"while IFS= read -r l; do id=$(printf '%s' "$l" | sed 's/.*"id":\([0-9]*\).*/\1/'); printf '{"id":%s,"err":"nope"}\n' "$id"; done"#);
-        let err = b.call(Req::Ping).unwrap_err();
+        let err = b.call(Req::Monitors).unwrap_err();
         assert_eq!(format!("{err:#}"), "nope");
     }
 

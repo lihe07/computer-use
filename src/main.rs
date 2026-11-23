@@ -1,4 +1,4 @@
-//! MCP server for desktop control on COSMIC/Wayland.
+//! MCP server for desktop control on Wayland and X11.
 
 mod control_lock;
 mod controller;
@@ -8,8 +8,10 @@ mod hud;
 mod keys;
 mod portal;
 mod portal_repair;
+mod wayland;
 mod windows;
 mod worker;
+mod x11;
 
 use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
@@ -24,7 +26,7 @@ use controller::Controller;
 use desktop::PasteKey;
 
 const INSTRUCTIONS: &str = "\
-Controls the user's real Wayland desktop (moves their actual cursor and keyboard focus).
+Controls the user's real desktop (moves their actual cursor and keyboard focus).
 Call `control` with enabled=true before any other tool: it shows the user an \"Agent is in
 control\" HUD so they stop using the mouse and keyboard. Call it with enabled=false as soon
 as you are done or need the user to act, to hand the desktop back.
@@ -362,43 +364,16 @@ impl ServerHandler for Server {
     }
 }
 
-/// MCP hosts may launch us with a scrubbed env; recover the user session's bus and display.
-fn fix_env() {
-    let runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| {
-        let uid = std::fs::metadata("/proc/self").map(|m| std::os::unix::fs::MetadataExt::uid(&m)).unwrap_or(1000);
-        format!("/run/user/{uid}")
-    });
-    // SAFETY: called before the tokio runtime spawns any threads.
-    unsafe {
-        std::env::set_var("XDG_RUNTIME_DIR", &runtime);
-        if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
-            std::env::set_var("DBUS_SESSION_BUS_ADDRESS", format!("unix:path={runtime}/bus"));
-        }
-        if std::env::var_os("WAYLAND_DISPLAY").is_none() {
-            let uid = std::fs::metadata("/proc/self").map(|m| std::os::unix::fs::MetadataExt::uid(&m)).unwrap_or(1000);
-            match portal_repair::discover(uid, std::path::Path::new(&runtime)) {
-                Ok(env) => {
-                    for (key, value) in env {
-                        if std::env::var_os(&key).is_none() {
-                            std::env::set_var(key, value);
-                        }
-                    }
-                }
-                Err(e) => eprintln!("computer-use: cannot infer desktop session: {e:#}"),
-            }
-        }
-    }
-}
-
 fn main() -> anyhow::Result<()> {
-    // Repair must inspect the caller's display before fix_env guesses one.
+    // Portal repair inspects the caller's original environment.
     if std::env::args().nth(1).as_deref() == Some("--repair-portal") {
         return portal_repair::run();
     }
-    fix_env();
+    let backend = desktop::Backend::select();
+    (backend.prepare_env)();
     match std::env::args().nth(1).as_deref() {
-        Some(hud::ARG) => return hud::run(),
-        Some(worker::ARG) => return worker::run(),
+        Some(hud::ARG) => return (backend.hud)(),
+        Some(worker::ARG) => return worker::run(backend),
         _ => {}
     }
     tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(async {
