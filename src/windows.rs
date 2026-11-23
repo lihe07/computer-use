@@ -29,14 +29,35 @@ pub struct Window {
     pub app_id: String,
     pub states: Vec<&'static str>,
     pub geometry: Vec<Geometry>,
-    #[serde(skip)]
-    pub(crate) closed: bool,
+}
+
+/// Match an exact ID before considering case-insensitive title or app ID substrings.
+pub fn find_window<'a, T>(query: &str, windows: impl Iterator<Item = (T, &'a Window)>) -> Result<T> {
+    let q = query.to_lowercase();
+    let mut matches = Vec::new();
+    for (item, window) in windows {
+        if window.id == query {
+            return Ok(item);
+        }
+        if window.title.to_lowercase().contains(&q) || window.app_id.to_lowercase().contains(&q) {
+            matches.push((item, window));
+        }
+    }
+    match matches.len() {
+        1 => Ok(matches.pop().unwrap().0),
+        0 => bail!("no window matches {query:?}"),
+        n => bail!(
+            "{n} windows match {query:?}; use an id: {}",
+            matches.iter().map(|(_, w)| format!("{} ({})", w.id, w.title)).collect::<Vec<_>>().join(", ")
+        ),
+    }
 }
 
 struct Top {
     ext: ext_handle::ExtForeignToplevelHandleV1,
     cosmic: Option<zcosmic_toplevel_handle_v1::ZcosmicToplevelHandleV1>,
     win: Window,
+    closed: bool,
 }
 
 #[derive(Default)]
@@ -91,33 +112,14 @@ impl Windows {
     }
 
     pub fn list(&self) -> Vec<Window> {
-        self.state.tops.iter().filter(|t| !t.win.closed).map(|t| t.win.clone()).collect()
-    }
-
-    fn find(&self, query: &str) -> Result<&Top> {
-        let tops: Vec<&Top> = self.state.tops.iter().filter(|t| !t.win.closed).collect();
-        if let Some(t) = tops.iter().find(|t| t.win.id == query) {
-            return Ok(t);
-        }
-        let q = query.to_lowercase();
-        let hits: Vec<&&Top> = tops
-            .iter()
-            .filter(|t| t.win.title.to_lowercase().contains(&q) || t.win.app_id.to_lowercase().contains(&q))
-            .collect();
-        match hits.len() {
-            1 => Ok(hits[0]),
-            0 => bail!("no window matches {query:?}"),
-            n => bail!(
-                "{n} windows match {query:?}; use an id: {}",
-                hits.iter().map(|t| format!("{} ({})", t.win.id, t.win.title)).collect::<Vec<_>>().join(", ")
-            ),
-        }
+        self.state.tops.iter().filter(|t| !t.closed).map(|t| t.win.clone()).collect()
     }
 
     /// Apply an action to a window matched by id or a unique title/app_id substring.
     pub fn act(&mut self, query: &str, action: &str) -> Result<Window> {
         let mgr = self.state.mgr.clone().ok_or_else(|| anyhow!("no zcosmic_toplevel_manager_v1"))?;
-        let top = self.find(query)?;
+        let tops = self.state.tops.iter().filter(|t| !t.closed);
+        let top = find_window(query, tops.map(|t| (t, &t.win)))?;
         let h = top.cosmic.clone().ok_or_else(|| anyhow!("window has no cosmic handle"))?;
         let win = top.win.clone();
         match action {
@@ -172,7 +174,7 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
 impl Dispatch<ext_list::ExtForeignToplevelListV1, ()> for State {
     fn event(s: &mut Self, _: &ext_list::ExtForeignToplevelListV1, ev: ext_list::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
         if let ext_list::Event::Toplevel { toplevel } = ev {
-            s.tops.push(Top { ext: toplevel, cosmic: None, win: Window::default() });
+            s.tops.push(Top { ext: toplevel, cosmic: None, win: Window::default(), closed: false });
         }
     }
 
@@ -188,7 +190,7 @@ impl Dispatch<ext_handle::ExtForeignToplevelHandleV1, ()> for State {
             ext_handle::Event::Title { title } => t.win.title = title,
             ext_handle::Event::AppId { app_id } => t.win.app_id = app_id,
             ext_handle::Event::Identifier { identifier } => t.win.id = identifier,
-            ext_handle::Event::Closed => t.win.closed = true,
+            ext_handle::Event::Closed => t.closed = true,
             _ => {}
         }
     }

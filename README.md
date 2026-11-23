@@ -2,7 +2,7 @@
 
 Computer-use MCP server for XFCE/X11 and COSMIC/Wayland. On X11 it uses
 GetImage for screenshots, XTEST for input, EWMH for window management, and
-RandR or Xinerama for monitor layout. COSMIC uses xdg-desktop-portal
+RandR 1.5 for monitor layout. COSMIC uses xdg-desktop-portal
 RemoteDesktop and libei.
 
 ## Running on XFCE/X11

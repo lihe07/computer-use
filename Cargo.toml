@@ -25,7 +25,7 @@ url = "2"
 layer-shell-wgpu-egui = { path = "vendor/layer-shell-egui" }
 egui = "0.32.3"
 smithay-client-toolkit = "0.20"
-x11rb = { version = "0.13", features = ["image", "xtest", "randr", "xinerama", "shape"] }
+x11rb = { version = "0.13", features = ["image", "xtest", "randr", "shape"] }
 
 [profile.release]
 strip = true
